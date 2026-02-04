@@ -42,6 +42,7 @@ image = (
         "polars>=0.20",
         "pyarrow>=14.0",
         "psutil>=5.9",
+        "s3fs>=2024.2",
         "slafdb",
     )
     # Copy local fast_scgpt package
@@ -63,16 +64,23 @@ def train_on_modal(
     learning_rate: float = 1e-4,
     log_every: int = 1,
     model_size: str = "small",
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
 ) -> dict:
     """Run training with GPU metrics on Modal.
 
     Args:
-        batch_size: Batch size for training
+        batch_size: Batch size for training (micro-batch if using accumulation)
         max_genes: Maximum genes per cell (affects seq_len)
         n_steps: Number of training steps
         learning_rate: Learning rate
         log_every: Log interval
         model_size: Model size preset (small/base/large)
+        gradient_accumulation_steps: Accumulate gradients over N micro-batches
+            Effective batch = batch_size * gradient_accumulation_steps
+        use_gradient_checkpointing: Trade compute for ~50% activation memory savings
+        use_compile: Use torch.compile for fused kernels (may speed up training)
 
     Returns:
         dict with training summary metrics
@@ -110,21 +118,36 @@ def train_on_modal(
     # slaf_path = "hf://datasets/slaf-project/Tahoe-100M/data/train"
 
     # SLAF dataset path from S3
-    slaf_path = "s3://slaf-datasets/Tahoe100M_train_SLAF"
+    slaf_path = "s3://slaf-datasets/Tahoe100M_test_SLAF"
 
     logger.info(f"SLAF path: {slaf_path}")
 
-    # Verify path exists
+    # Verify S3 connectivity before creating dataloader
     import os
 
-    # if not os.path.exists(slaf_path):
-    #     logger.error(f"SLAF path not found: {slaf_path}")
-    #     logger.info("Available paths in /data:")
-    #     for root, dirs, _files in os.walk("/data"):
-    #         for d in dirs:
-    #             logger.info(f"  {os.path.join(root, d)}")
-    #         break
-    #     return {"error": f"SLAF path not found: {slaf_path}"}
+    if slaf_path.startswith("s3://"):
+        logger.info("Verifying S3 connectivity...")
+        try:
+            import s3fs
+
+            # Check if AWS credentials are available
+            aws_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+            aws_region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+            logger.info(f"AWS_ACCESS_KEY_ID present: {bool(aws_key)}")
+            logger.info(f"AWS_DEFAULT_REGION: {aws_region}")
+
+            fs = s3fs.S3FileSystem()
+            # List files in the SLAF directory
+            bucket_path = slaf_path.replace("s3://", "")
+            files = fs.ls(bucket_path)
+            logger.info(f"S3 path accessible, found {len(files)} items:")
+            for f in files[:5]:  # Show first 5
+                logger.info(f"  {f}")
+            if len(files) > 5:
+                logger.info(f"  ... and {len(files) - 5} more")
+        except Exception as e:
+            logger.error(f"S3 connectivity check failed: {e}")
+            return {"error": f"S3 access failed: {e}"}
 
     # Get model config
     if model_size == "small":
@@ -149,6 +172,9 @@ def train_on_modal(
     # Enable sync CUDA errors for better debugging
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
+    # Memory optimization: expandable segments reduces fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     # Run training
     metrics = train(
         slaf_path=slaf_path,
@@ -158,6 +184,9 @@ def train_on_modal(
         max_genes=max_genes,
         learning_rate=learning_rate,
         log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
     )
 
     # Build results dict
@@ -207,20 +236,31 @@ def main(
     learning_rate: float = 1e-4,
     log_every: int = 1,
     model_size: str = "small",
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
 ) -> None:
     """Run training benchmark from local machine.
 
     Args:
         batch_size: Batch size (default: 32)
-        max_genes: Max genes per cell (default: 512)
+        max_genes: Max genes per cell (default: 64)
         n_steps: Training steps (default: 500)
         learning_rate: LR (default: 1e-4)
-        log_every: Log interval (default: 10)
+        log_every: Log interval (default: 1)
         model_size: small/base/large (default: small)
+        gradient_accumulation_steps: Effective batch = batch_size * this
+        use_gradient_checkpointing: Trade compute for memory
+        use_compile: Use torch.compile for fused kernels
     """
+    effective_batch = batch_size * gradient_accumulation_steps
     print("Launching fast-scGPT training on Modal GPU...")
     print(f"  batch_size={batch_size}, max_genes={max_genes}, n_steps={n_steps}")
     print(f"  model_size={model_size}, lr={learning_rate}")
+    print(f"  gradient_accumulation_steps={gradient_accumulation_steps}")
+    print(f"  effective_batch_size={effective_batch}")
+    print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
+    print(f"  use_compile={use_compile}")
     print()
 
     result = train_on_modal.remote(
@@ -230,6 +270,9 @@ def main(
         learning_rate=learning_rate,
         log_every=log_every,
         model_size=model_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
     )
 
     print()
