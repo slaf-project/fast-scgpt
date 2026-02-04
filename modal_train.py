@@ -68,6 +68,7 @@ def train_on_modal(
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
     profile: bool = False,
+    data_source: str = "s3",
 ) -> dict:
     """Run training with GPU metrics on Modal.
 
@@ -83,6 +84,7 @@ def train_on_modal(
         use_gradient_checkpointing: Trade compute for ~50% activation memory savings
         use_compile: Use torch.compile for fused kernels (may speed up training)
         profile: Log timing breakdown (data/mask/forward/backward/optim)
+        data_source: Data source - "s3", "volume", or "hf" (HuggingFace)
 
     Returns:
         dict with training summary metrics
@@ -113,15 +115,18 @@ def train_on_modal(
         logger.error("CUDA not available! Check Modal GPU allocation.")
         return {"error": "CUDA not available"}
 
-    # SLAF dataset path from mounted volume
-    # slaf_path = "/data/tigris/Tahoe100M_train_SLAF"
+    # Select data source
+    if data_source == "volume":
+        slaf_path = "/data/tigris/Tahoe100M_train_SLAF"
+    elif data_source == "hf":
+        slaf_path = "hf://datasets/slaf-project/Tahoe-100M/data/train"
+    elif data_source == "s3":
+        slaf_path = "s3://slaf-datasets/Tahoe100M_train_SLAF"
+    else:
+        logger.error(f"Unknown data_source: {data_source}. Use 's3', 'volume', or 'hf'")
+        return {"error": f"Unknown data_source: {data_source}"}
 
-    # SLAF dataset path from Hugging Face
-    # slaf_path = "hf://datasets/slaf-project/Tahoe-100M/data/train"
-
-    # SLAF dataset path from S3
-    slaf_path = "s3://slaf-datasets/Tahoe100M_train_SLAF"
-
+    logger.info(f"Data source: {data_source}")
     logger.info(f"SLAF path: {slaf_path}")
 
     # Verify S3 connectivity before creating dataloader
@@ -243,6 +248,7 @@ def main(
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
     profile: bool = False,
+    data_source: str = "s3",
 ) -> None:
     """Run training benchmark from local machine.
 
@@ -257,6 +263,7 @@ def main(
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
         profile: Log timing breakdown per step
+        data_source: Data source - "s3", "volume", or "hf"
     """
     effective_batch = batch_size * gradient_accumulation_steps
     print("Launching fast-scGPT training on Modal GPU...")
@@ -267,6 +274,7 @@ def main(
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
     print(f"  profile={profile}")
+    print(f"  data_source={data_source}")
     print()
 
     result = train_on_modal.remote(
@@ -280,6 +288,7 @@ def main(
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
         profile=profile,
+        data_source=data_source,
     )
 
     print()
