@@ -1,0 +1,260 @@
+"""Modal training script for fast-scGPT GPU benchmarking.
+
+This script deploys training to Modal's GPU infrastructure for CUDA benchmarking.
+Targets L4 GPU (24GB, $0.99/hr) as the cheapest viable option for the small model.
+
+Usage:
+    # Run with defaults (500 steps)
+    modal run modal_train.py
+
+    # Custom configuration
+    modal run modal_train.py --batch-size 64 --n-steps 1000
+
+    # Test with minimal config
+    modal run modal_train.py --batch-size 8 --max-genes 128 --n-steps 50
+
+    # Run in detached mode (continues after terminal closes)
+    modal run --detach modal_train.py --n-steps 1000
+
+    # Check logs for detached runs
+    modal app logs fast-scgpt-benchmark
+
+Results are saved to /data/benchmark_results/ on the volume.
+"""
+
+import modal
+
+# Create Modal app
+app = modal.App("fast-scgpt-benchmark")
+
+# Mount existing Modal volume with SLAF datasets
+slaf_volume = modal.Volume.from_name("slaf-datasets")
+
+# Build image with CUDA + dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .pip_install(
+        "torch>=2.0",
+        "einops>=0.7",
+        "numpy>=1.24",
+        "loguru>=0.7",
+        "polars>=0.20",
+        "pyarrow>=14.0",
+        "psutil>=5.9",
+        "slafdb",
+    )
+    # Copy local fast_scgpt package
+    .add_local_dir("fast_scgpt", "/root/fast_scgpt")
+)
+
+
+@app.function(
+    image=image,
+    gpu="L4",  # 24GB VRAM, 100 FP16 TFLOPS, $0.99/hr
+    timeout=7200,  # 2 hours max
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+)
+def train_on_modal(
+    batch_size: int = 32,
+    max_genes: int = 64,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "small",
+) -> dict:
+    """Run training with GPU metrics on Modal.
+
+    Args:
+        batch_size: Batch size for training
+        max_genes: Maximum genes per cell (affects seq_len)
+        n_steps: Number of training steps
+        learning_rate: Learning rate
+        log_every: Log interval
+        model_size: Model size preset (small/base/large)
+
+    Returns:
+        dict with training summary metrics
+    """
+    import sys
+
+    sys.path.insert(0, "/root")
+
+    import torch
+    from loguru import logger
+
+    from fast_scgpt.config import ModelConfig
+    from fast_scgpt.train import train
+
+    # Log GPU info
+    logger.info("=" * 60)
+    logger.info("Modal GPU Benchmark - fast-scGPT")
+    logger.info("=" * 60)
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        props = torch.cuda.get_device_properties(0)
+        logger.info(f"GPU Memory: {props.total_memory / 1e9:.1f} GB")
+        logger.info(f"Compute Capability: {props.major}.{props.minor}")
+        logger.info(f"SM Count: {props.multi_processor_count}")
+    else:
+        logger.error("CUDA not available! Check Modal GPU allocation.")
+        return {"error": "CUDA not available"}
+
+    # SLAF dataset path from mounted volume
+    # slaf_path = "/data/tigris/Tahoe100M_train_SLAF"
+
+    # SLAF dataset path from Hugging Face
+    # slaf_path = "hf://datasets/slaf-project/Tahoe-100M/data/train"
+
+    # SLAF dataset path from S3
+    slaf_path = "s3://slaf-datasets/Tahoe100M_train_SLAF"
+
+    logger.info(f"SLAF path: {slaf_path}")
+
+    # Verify path exists
+    import os
+
+    # if not os.path.exists(slaf_path):
+    #     logger.error(f"SLAF path not found: {slaf_path}")
+    #     logger.info("Available paths in /data:")
+    #     for root, dirs, _files in os.walk("/data"):
+    #         for d in dirs:
+    #             logger.info(f"  {os.path.join(root, d)}")
+    #         break
+    #     return {"error": f"SLAF path not found: {slaf_path}"}
+
+    # Get model config
+    if model_size == "small":
+        config = ModelConfig.small()
+    elif model_size == "base":
+        config = ModelConfig.base()
+    elif model_size == "large":
+        config = ModelConfig.large()
+    else:
+        logger.error(f"Unknown model size: {model_size}")
+        return {"error": f"Unknown model size: {model_size}"}
+
+    logger.info(f"Model size: {model_size}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Max genes: {max_genes}")
+    logger.info(f"N steps: {n_steps}")
+    logger.info(f"Config vocab_size: {config.vocab_size}")
+    logger.info(f"Config n_expression_bins: {config.n_expression_bins}")
+    logger.info(f"Config total_vocab_size: {config.total_vocab_size}")
+    logger.info("=" * 60)
+
+    # Enable sync CUDA errors for better debugging
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    # Run training
+    metrics = train(
+        slaf_path=slaf_path,
+        config=config,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        max_genes=max_genes,
+        learning_rate=learning_rate,
+        log_every=log_every,
+    )
+
+    # Build results dict
+    summary = metrics.summary()
+    result = {
+        "status": "success",
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "max_genes": max_genes,
+        "model_size": model_size,
+        "avg_step_time_ms": summary["avg_step_time_ms"],
+        "avg_cells_per_sec": (
+            summary["total_cells"] / (summary["avg_step_time_ms"] * n_steps / 1000)
+            if summary["avg_step_time_ms"] > 0
+            else 0
+        ),
+        "total_cells": summary["total_cells"],
+        "total_tokens": summary["total_tokens"],
+        "peak_memory_gb": summary["peak_memory_gb"],
+        "memory_utilization_pct": summary["memory_utilization_pct"],
+        "gpu_name": torch.cuda.get_device_name(0),
+    }
+
+    # Save results to volume for detached runs
+    import json
+    from datetime import datetime
+
+    results_dir = "/data/benchmark_results"
+    os.makedirs(results_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = f"{results_dir}/benchmark_{timestamp}.json"
+
+    with open(results_file, "w") as f:
+        json.dump(result, f, indent=2)
+
+    logger.info(f"Results saved to: {results_file}")
+
+    return result
+
+
+@app.local_entrypoint()
+def main(
+    batch_size: int = 32,
+    max_genes: int = 64,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "small",
+) -> None:
+    """Run training benchmark from local machine.
+
+    Args:
+        batch_size: Batch size (default: 32)
+        max_genes: Max genes per cell (default: 512)
+        n_steps: Training steps (default: 500)
+        learning_rate: LR (default: 1e-4)
+        log_every: Log interval (default: 10)
+        model_size: small/base/large (default: small)
+    """
+    print("Launching fast-scGPT training on Modal GPU...")
+    print(f"  batch_size={batch_size}, max_genes={max_genes}, n_steps={n_steps}")
+    print(f"  model_size={model_size}, lr={learning_rate}")
+    print()
+
+    result = train_on_modal.remote(
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        model_size=model_size,
+    )
+
+    print()
+    print("=" * 60)
+    print("BENCHMARK RESULTS")
+    print("=" * 60)
+
+    if result.get("status") == "success":
+        print("Status: SUCCESS")
+        print(f"Steps completed: {result['n_steps']}")
+        print(f"Batch size: {result['batch_size']}")
+        print(f"Max genes: {result['max_genes']}")
+        print(f"Model size: {result['model_size']}")
+        print()
+        print("Performance:")
+        print(f"  Avg step time: {result['avg_step_time_ms']:.1f} ms")
+        print(f"  Avg throughput: {result['avg_cells_per_sec']:.0f} cells/sec")
+        print(f"  Total cells: {result['total_cells']:,}")
+        print(f"  Total tokens: {result['total_tokens']:,}")
+        print()
+        print("Memory:")
+        print(f"  Peak memory: {result['peak_memory_gb']:.2f} GB")
+        print(f"  Utilization: {result['memory_utilization_pct']:.0f}%")
+    else:
+        print("Status: FAILED")
+        print(f"Error: {result.get('error', 'Unknown error')}")
+
+    print("=" * 60)

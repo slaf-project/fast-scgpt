@@ -38,6 +38,9 @@ slaf = [
 cuda = [
     "flash-attn>=2.5",
 ]
+modal = [
+    "modal>=0.60",
+]
 
 [build-system]
 requires = ["hatchling"]
