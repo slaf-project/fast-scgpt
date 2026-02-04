@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from fast_scgpt.config import ModelConfig
 
@@ -160,15 +161,30 @@ class TransformerBlock(nn.Module):
 
     Phase 1: Standard LayerNorm.
     Phase 2 will use RMSNorm without learnable parameters.
+
+    Supports gradient checkpointing for memory efficiency during training.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, use_checkpoint: bool = False) -> None:
         super().__init__()
         self.attention = MultiHeadAttention(config)
         self.ff = FeedForward(config)
         self.ln1 = nn.LayerNorm(config.d_model)  # Phase 2: RMSNorm
         self.ln2 = nn.LayerNorm(config.d_model)  # Phase 2: RMSNorm
         self.dropout = nn.Dropout(config.dropout)
+        self.use_checkpoint = use_checkpoint
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Core forward implementation."""
+        # Pre-norm attention
+        x = x + self.dropout(self.attention(self.ln1(x), attention_mask))
+        # Pre-norm feed-forward
+        x = x + self.dropout(self.ff(self.ln2(x)))
+        return x
 
     def forward(
         self,
@@ -184,11 +200,17 @@ class TransformerBlock(nn.Module):
         Returns:
             Output of shape (batch, seq_len, d_model)
         """
-        # Pre-norm attention
-        x = x + self.dropout(self.attention(self.ln1(x), attention_mask))
-        # Pre-norm feed-forward
-        x = x + self.dropout(self.ff(self.ln2(x)))
-        return x
+        if self.use_checkpoint and self.training:
+            # Gradient checkpointing: recompute forward during backward
+            # Trades compute for ~50% memory savings on activations
+            result: torch.Tensor = checkpoint(
+                self._forward_impl,
+                x,
+                attention_mask,
+                use_reentrant=False,
+            )
+            return result
+        return self._forward_impl(x, attention_mask)
 
 
 class ScGPT(nn.Module):
@@ -199,18 +221,26 @@ class ScGPT(nn.Module):
 
     The model uses a shared embedding for both gene tokens and expression bins,
     summing them at each position to create the input representation.
+
+    Supports gradient checkpointing for memory-efficient training.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(
+        self, config: ModelConfig, use_gradient_checkpointing: bool = False
+    ) -> None:
         super().__init__()
         self.config = config
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Token embedding (genes + special tokens + expression bins)
         self.embedding = TokenEmbedding(config)
 
-        # Transformer blocks
+        # Transformer blocks with optional gradient checkpointing
         self.blocks = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
+            [
+                TransformerBlock(config, use_checkpoint=use_gradient_checkpointing)
+                for _ in range(config.n_layers)
+            ]
         )
 
         # Final layer norm
@@ -347,6 +377,20 @@ class ScGPT(nn.Module):
     def num_parameters(self) -> int:
         """Count total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Enable or disable gradient checkpointing for all transformer blocks.
+
+        Gradient checkpointing reduces memory usage by ~50% for activations
+        by recomputing intermediate values during the backward pass.
+
+        Args:
+            enabled: If True, enable checkpointing; if False, disable it.
+        """
+        self.use_gradient_checkpointing = enabled
+        for block in self.blocks:
+            if isinstance(block, TransformerBlock):
+                block.use_checkpoint = enabled
 
     @classmethod
     def from_config(cls, config: ModelConfig) -> "ScGPT":
