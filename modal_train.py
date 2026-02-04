@@ -48,12 +48,13 @@ image = (
         "s3fs>=2024.2",
         "packaging",
         "ninja",
+        "wheel",
+        "setuptools",
         "slafdb",
     )
     # Flash Attention 2 - build from source with CUDA
-    .pip_install(
-        "flash-attn",
-        extra_options="--no-build-isolation",
+    .run_commands(
+        "pip install flash-attn --no-build-isolation",
     )
     # Copy local fast_scgpt package
     .add_local_dir("fast_scgpt", "/root/fast_scgpt")
