@@ -557,10 +557,19 @@ def train(
 
     # Process pre-fetched batch first, then continue with iterator
     batches = itertools.chain([first_batch], dataloader_iter)
+    batch_iter = iter(batches)
+    dataloader_time_ms = 0.0  # Track time waiting for dataloader
 
-    for batch in batches:
-        if step >= n_steps:
+    while step < n_steps:
+        # Measure dataloader wait time
+        dl_start = time.perf_counter()
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            logger.warning("Dataloader exhausted before completing {} steps", n_steps)
             break
+        dl_end = time.perf_counter()
+        dataloader_time_ms = (dl_end - dl_start) * 1000
 
         # Debug: check token bounds on first batch
         if step == 0 and micro_step == 0:
@@ -671,13 +680,22 @@ def train(
 
                 # Log timing breakdown if profiling
                 if profile and "timing_data_ms" in loss_dict:
+                    compute_total = (
+                        loss_dict["timing_data_ms"]
+                        + loss_dict["timing_mask_ms"]
+                        + loss_dict["timing_forward_ms"]
+                        + loss_dict["timing_backward_ms"]
+                        + loss_dict["timing_optim_ms"]
+                    )
                     logger.info(
-                        "  Timing: data={:.1f}ms mask={:.1f}ms fwd={:.1f}ms bwd={:.1f}ms opt={:.1f}ms",
+                        "  Timing: dl={:.1f}ms | data={:.1f}ms mask={:.1f}ms fwd={:.1f}ms bwd={:.1f}ms opt={:.1f}ms | total={:.1f}ms",
+                        dataloader_time_ms,
                         loss_dict["timing_data_ms"],
                         loss_dict["timing_mask_ms"],
                         loss_dict["timing_forward_ms"],
                         loss_dict["timing_backward_ms"],
                         loss_dict["timing_optim_ms"],
+                        dataloader_time_ms + compute_total,
                     )
 
                 total_loss = 0.0
