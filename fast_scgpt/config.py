@@ -29,8 +29,12 @@ class ModelConfig:
     d_ff: int | None = None  # Defaults to 4 * d_model
 
     # Vocabulary
-    vocab_size: int = 50000
-    n_expression_bins: int = 10
+    # vocab_size = special tokens (4) + num_genes
+    # For Tahoe100M: 4 + 62710 = 62714
+    # expr_token_offset should equal vocab_size so expressions don't collide with genes
+    # Adding buffer for safety (SLAF may have additional tokens)
+    vocab_size: int = 62714  # 4 special + 62710 genes
+    n_expression_bins: int = 200  # Extra headroom (SLAF uses up to ~150)
     max_seq_len: int = 2050  # 2 * 1024 + 2 (CLS + SEP)
 
     # Regularization
@@ -43,18 +47,22 @@ class ModelConfig:
     sep_token_id: int = 2
     mask_token_id: int = 3
     gene_token_offset: int = 4  # Genes start at token ID 4
+    # expr_token_offset is computed in __post_init__ to equal vocab_size
 
     # Computed fields
     _d_ff: int = field(init=False, repr=False)
     _total_vocab_size: int = field(init=False, repr=False)
+    _expr_token_offset: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate and compute derived fields."""
         # Compute feed-forward dimension
         self._d_ff = self.d_ff if self.d_ff is not None else 4 * self.d_model
 
-        # Total vocab = genes + special tokens + expression bins
-        # Expression bins start at vocab_size
+        # Expression tokens start right after gene tokens (no overlap)
+        self._expr_token_offset = self.vocab_size
+
+        # Total vocab = vocab_size + expression bins
         self._total_vocab_size = self.vocab_size + self.n_expression_bins
 
         # Validate head dimension
@@ -77,6 +85,11 @@ class ModelConfig:
     def total_vocab_size(self) -> int:
         """Total vocabulary including expression bins."""
         return self._total_vocab_size
+
+    @property
+    def expr_token_offset(self) -> int:
+        """Offset where expression tokens start (equals vocab_size)."""
+        return self._expr_token_offset
 
     @classmethod
     def small(cls) -> "ModelConfig":
