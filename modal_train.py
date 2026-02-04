@@ -1,7 +1,6 @@
 """Modal training script for fast-scGPT GPU benchmarking.
 
 This script deploys training to Modal's GPU infrastructure for CUDA benchmarking.
-Targets L4 GPU (24GB, $0.99/hr) as the cheapest viable option for the small model.
 
 Usage:
     # Run with defaults (500 steps)
@@ -45,6 +44,11 @@ image = (
         "s3fs>=2024.2",
         "slafdb",
     )
+    # Flash Attention 2 - prebuilt wheels for CUDA
+    .pip_install(
+        "flash-attn",
+        extra_options="--no-build-isolation",
+    )
     # Copy local fast_scgpt package
     .add_local_dir("fast_scgpt", "/root/fast_scgpt")
 )
@@ -52,7 +56,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="L4",  # 24GB VRAM, 100 FP16 TFLOPS, $0.99/hr
+    gpu="A100-80GB",
     timeout=7200,  # 2 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],

@@ -401,6 +401,12 @@ def train(
     logger.info("Device info: {}", get_device_info())
     logger.info("Training dtype: {}", dtype)
 
+    # Check Flash Attention availability
+    if device.type == "cuda":
+        from fast_scgpt.attention import check_flash_attn
+
+        check_flash_attn()
+
     # Load SLAF data FIRST to get vocab_size
     try:
         from slaf import SLAFArray

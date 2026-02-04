@@ -56,10 +56,10 @@ class TokenEmbedding(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention.
+    """Multi-head self-attention with Flash Attention 2 support.
 
-    Phase 1: Standard scaled dot-product attention.
-    Phase 2 will add QK-Norm for training stability.
+    Uses Flash Attention 2 when available (CUDA, sm80+), falls back to
+    PyTorch SDPA otherwise. Flash Attention is O(n) memory vs O(n²).
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -67,6 +67,7 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = config.n_heads
         self.d_head = config.d_head
         self.d_model = config.d_model
+        self.dropout_p = config.dropout
 
         # Q, K, V projections
         self.q_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
@@ -74,7 +75,6 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
 
-        self.dropout = nn.Dropout(config.dropout)
         self.scale = 1.0 / math.sqrt(self.d_head)
 
     def forward(
@@ -88,11 +88,12 @@ class MultiHeadAttention(nn.Module):
             x: Input of shape (batch, seq_len, d_model)
             attention_mask: Boolean mask of shape (batch, seq_len).
                 True for positions to attend to, False for padding.
+                Note: Flash Attention ignores masks, falls back to SDPA if mask provided.
 
         Returns:
             Output of shape (batch, seq_len, d_model)
         """
-        batch_size, seq_len, _ = x.shape
+        from fast_scgpt.attention import attention_with_reshape
 
         # Project to Q, K, V
         q = self.q_proj(x)
@@ -104,21 +105,26 @@ class MultiHeadAttention(nn.Module):
         k = rearrange(k, "b s (h d) -> b h s d", h=self.n_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
 
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Apply attention mask (bidirectional, not causal)
+        # Convert attention mask for SDPA if provided
+        # attention_mask: (batch, seq_len) bool -> (batch, 1, 1, seq_len) float
+        attn_mask = None
         if attention_mask is not None:
-            # attention_mask: (batch, seq_len) -> (batch, 1, 1, seq_len)
-            mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(~mask, float("-inf"))
+            attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = attn_mask.to(dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(
+                ~attention_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
 
-        # Softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Apply attention to values
-        out = torch.matmul(attn_weights, v)
+        # Use Flash Attention if available, else SDPA
+        out = attention_with_reshape(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            causal=False,  # Bidirectional attention for scGPT
+            scale=self.scale,
+        )
 
         # Reshape back to (batch, seq_len, d_model)
         out = rearrange(out, "b h s d -> b s (h d)")
