@@ -11,6 +11,7 @@ This module implements masked gene expression prediction training:
 """
 
 import argparse
+import itertools
 import sys
 import time
 from dataclasses import dataclass, field
@@ -182,6 +183,44 @@ def create_mask(
     return masked_input_ids, gene_targets, expr_targets, mask_positions
 
 
+def clip_expression_tokens(
+    input_ids: torch.Tensor,
+    vocab_size: int,
+    n_expression_bins: int,
+) -> torch.Tensor:
+    """Clip expression tokens to valid range.
+
+    Workaround for SLAF tokenizer bug where integer expression values
+    bypass clipping (see PRDs/BUG-slaf-tokenizer-expression-clipping.md).
+
+    Expression tokens are at positions vocab_size + bin_id.
+    This clips bin_id to [0, n_expression_bins - 1].
+
+    Args:
+        input_ids: Token IDs (batch, seq_len)
+        vocab_size: Size of gene vocabulary (expression tokens start here)
+        n_expression_bins: Number of valid expression bins
+
+    Returns:
+        Token IDs with expression bins clipped to valid range
+    """
+    # Identify expression tokens (those >= vocab_size)
+    is_expr_token = input_ids >= vocab_size
+
+    if not is_expr_token.any():
+        return input_ids
+
+    # Clone to avoid modifying input
+    clipped = input_ids.clone()
+
+    # Extract expression bin IDs, clip, and reconstruct tokens
+    expr_bins = clipped[is_expr_token] - vocab_size
+    clipped_bins = torch.clamp(expr_bins, 0, n_expression_bins - 1)
+    clipped[is_expr_token] = clipped_bins + vocab_size
+
+    return clipped
+
+
 def train_step(
     model: ScGPT,
     batch: dict[str, torch.Tensor],
@@ -190,8 +229,10 @@ def train_step(
     device: torch.device,
     scaler: torch.amp.GradScaler | None = None,
     use_amp: bool = True,
+    gradient_accumulation_steps: int = 1,
+    is_accumulation_boundary: bool = True,
 ) -> dict[str, float]:
-    """Execute a single training step.
+    """Execute a single training step with gradient accumulation support.
 
     Args:
         model: The ScGPT model
@@ -201,16 +242,22 @@ def train_step(
         device: Device to train on
         scaler: GradScaler for mixed precision (CUDA only)
         use_amp: Whether to use automatic mixed precision
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        is_accumulation_boundary: If True, perform optimizer step after backward
 
     Returns:
         dict with loss values
     """
     model.train()
-    optimizer.zero_grad()
 
     # Move batch to device
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
+
+    # Clip expression tokens to valid range (workaround for SLAF tokenizer bug)
+    input_ids = clip_expression_tokens(
+        input_ids, config.vocab_size, config.n_expression_bins
+    )
 
     # Create masking
     masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
@@ -239,17 +286,23 @@ def train_step(
             expr_targets,
             gene_mask,
         )
-        loss = loss_dict["loss"]
+        # Scale loss for gradient accumulation
+        loss = loss_dict["loss"] / gradient_accumulation_steps
 
     # Backward pass with gradient scaling
     if scaler is not None and use_autocast:
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        if is_accumulation_boundary:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
     else:
         loss.backward()
-        optimizer.step()
+        if is_accumulation_boundary:
+            optimizer.step()
+            optimizer.zero_grad()
 
+    # Return unscaled loss for logging
     return {k: v.item() for k, v in loss_dict.items()}
 
 
@@ -261,6 +314,9 @@ def train(
     max_genes: int = 512,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
 ) -> GPUMetrics:
     """Train ScGPT on SLAF data.
 
@@ -268,10 +324,16 @@ def train(
         slaf_path: Path to SLAF dataset
         config: Model configuration (default: small)
         n_steps: Number of training steps
-        batch_size: Batch size
+        batch_size: Batch size (micro-batch if using gradient accumulation)
         max_genes: Maximum genes per cell
         learning_rate: Learning rate
         log_every: Log every N steps
+        gradient_accumulation_steps: Accumulate gradients over N micro-batches
+            Effective batch size = batch_size * gradient_accumulation_steps
+        use_gradient_checkpointing: Enable gradient checkpointing to reduce
+            activation memory by ~50% (trades compute for memory)
+        use_compile: Use torch.compile for fused kernels and potential speedup
+            (may increase compilation time on first step)
 
     Returns:
         GPUMetrics with training statistics
@@ -317,8 +379,21 @@ def train(
 
     # NOW create model with correct vocab_size
     logger.info("Model config: {}", config)
-    model = ScGPT(config).to(device)
+    model = ScGPT(config, use_gradient_checkpointing=use_gradient_checkpointing).to(
+        device
+    )
     logger.info("Model parameters: {:,}", model.num_parameters)
+
+    # Optional: torch.compile for fused kernels and speedup
+    if use_compile and device.type == "cuda":
+        logger.info("Compiling model with torch.compile (mode='reduce-overhead')...")
+        model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
+        logger.info("Model compiled successfully")
+    elif use_compile:
+        logger.warning("torch.compile requested but not on CUDA - skipping")
+
+    if use_gradient_checkpointing:
+        logger.info("Gradient checkpointing enabled (trades compute for memory)")
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -344,6 +419,7 @@ def train(
         n_expression_bins=config.n_expression_bins,
         vocab_size=vocab_size,  # Expression tokens start at vocab_size
         use_mixture_of_scanners=True,
+        prefetch_batch_size=512000,
         verbose=False,
     )
     logger.info("SLAFDataLoader created in {:.2f}s", time.time() - t0)
@@ -356,26 +432,85 @@ def train(
     reset_cuda_stats(device)
 
     # Training loop
+    effective_batch_size = batch_size * gradient_accumulation_steps
     logger.info("Starting training for {} steps", n_steps)
     logger.info(
-        "Batch size: {}, Max genes: {}, Seq len: {}", batch_size, max_genes, seq_len
+        "Batch size: {} (effective: {} with {} accumulation steps)",
+        batch_size,
+        effective_batch_size,
+        gradient_accumulation_steps,
     )
+    logger.info("Max genes: {}, Seq len: {}", max_genes, seq_len)
+
+    # Pre-fetch first batch with retry logic for intermittent S3 issues
+    logger.info("Pre-fetching first batch (with retry for S3 intermittent issues)...")
+    max_retries = 3
+    first_batch = None
+    last_error = None
+
+    for attempt in range(max_retries):
+        prefetch_start = time.time()
+        try:
+            # Create fresh iterator on each retry
+            dataloader_iter = iter(dataloader)
+            first_batch = next(dataloader_iter)
+            logger.info(
+                "First batch received in {:.2f}s (shape: {}, attempt {}/{})",
+                time.time() - prefetch_start,
+                first_batch["input_ids"].shape,
+                attempt + 1,
+                max_retries,
+            )
+            break  # Success
+        except StopIteration:
+            last_error = "Dataloader returned no batches"
+            logger.warning(
+                "Attempt {}/{}: {} after {:.1f}s",
+                attempt + 1,
+                max_retries,
+                last_error,
+                time.time() - prefetch_start,
+            )
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(
+                "Attempt {}/{}: Failed after {:.1f}s: {}",
+                attempt + 1,
+                max_retries,
+                time.time() - prefetch_start,
+                e,
+            )
+
+        if attempt < max_retries - 1:
+            wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+            logger.info("Retrying in {}s...", wait_time)
+            time.sleep(wait_time)
+
+    if first_batch is None:
+        logger.error("Failed to fetch first batch after {} attempts", max_retries)
+        raise RuntimeError(
+            f"Dataloader failed after {max_retries} retries: {last_error}"
+        )
+
     step = 0
+    micro_step = 0  # Tracks position within gradient accumulation window
     total_loss = 0.0
     start_time = time.time()
     first_loss = None
     last_loss = None
 
-    logger.info("Fetching first batch from dataloader...")
-    t0 = time.time()
-    for batch in dataloader:
-        if step == 0:
-            logger.info("First batch received in {:.2f}s", time.time() - t0)
+    # Initialize gradients
+    optimizer.zero_grad()
+
+    # Process pre-fetched batch first, then continue with iterator
+    batches = itertools.chain([first_batch], dataloader_iter)
+
+    for batch in batches:
         if step >= n_steps:
             break
 
         # Debug: check token bounds on first batch
-        if step == 0:
+        if step == 0 and micro_step == 0:
             input_ids = batch["input_ids"]
             max_token = input_ids.max().item()
             min_token = input_ids.min().item()
@@ -385,9 +520,20 @@ def train(
                 max_token,
                 config.total_vocab_size,
             )
+            # Check if clipping will be needed (before clipping is applied)
+            max_expr_bin = (
+                max_token - config.vocab_size if max_token >= config.vocab_size else 0
+            )
+            if max_expr_bin >= config.n_expression_bins:
+                logger.warning(
+                    "Expression bin {} exceeds n_expression_bins={}. "
+                    "Tokens will be clipped (SLAF tokenizer bug workaround).",
+                    max_expr_bin,
+                    config.n_expression_bins,
+                )
             if max_token >= config.total_vocab_size:
-                logger.error(
-                    "Token ID {} exceeds vocab size {}! Increase config.vocab_size.",
+                logger.warning(
+                    "Token ID {} exceeds vocab size {}. Will be clipped to valid range.",
                     max_token,
                     config.total_vocab_size,
                 )
@@ -415,7 +561,21 @@ def train(
             torch.cuda.synchronize(device)
         step_start = time.perf_counter()
 
-        loss_dict = train_step(model, batch, optimizer, config, device, scaler, use_amp)
+        # Determine if this is the last micro-batch in accumulation window
+        micro_step += 1
+        is_accumulation_boundary = micro_step >= gradient_accumulation_steps
+
+        loss_dict = train_step(
+            model,
+            batch,
+            optimizer,
+            config,
+            device,
+            scaler,
+            use_amp,
+            gradient_accumulation_steps,
+            is_accumulation_boundary,
+        )
 
         # Synchronize after step for accurate timing
         if device.type == "cuda":
@@ -423,37 +583,43 @@ def train(
         step_end = time.perf_counter()
         step_time_ms = (step_end - step_start) * 1000
 
-        # Update metrics
-        metrics.update(step_time_ms, batch_size, seq_len, device)
-
+        # Accumulate loss (train_step returns unscaled loss)
         total_loss += loss_dict["loss"]
         last_loss = loss_dict["loss"]
         if first_loss is None:
             first_loss = loss_dict["loss"]
 
-        if (step + 1) % log_every == 0:
-            avg_loss = total_loss / log_every
+        # Only count as a "step" when we've done optimizer.step()
+        if is_accumulation_boundary:
+            micro_step = 0  # Reset for next accumulation window
 
-            # Build log message with GPU metrics
-            log_parts = [
-                f"Step {step + 1}/{n_steps}",
-                f"Loss: {avg_loss:.4f} (gene: {loss_dict['gene_loss']:.4f}, expr: {loss_dict['expr_loss']:.4f})",
-                f"Time: {metrics.step_time_ms:.1f}ms/step",
-                f"Throughput: {metrics.cells_per_sec:.0f} cells/sec",
-            ]
+            # Update metrics with effective batch size
+            metrics.update(step_time_ms, effective_batch_size, seq_len, device)
 
-            # Add memory info for CUDA
-            if device.type == "cuda":
-                log_parts.append(
-                    f"Memory: {metrics.peak_memory_gb:.2f}GB ({metrics.memory_utilization_pct:.0f}%)"
-                )
+            if (step + 1) % log_every == 0:
+                avg_loss = total_loss / (log_every * gradient_accumulation_steps)
 
-            logger.info(" | ".join(log_parts))
-            total_loss = 0.0
+                # Build log message with GPU metrics
+                log_parts = [
+                    f"Step {step + 1}/{n_steps}",
+                    f"Loss: {avg_loss:.4f} (gene: {loss_dict['gene_loss']:.4f}, expr: {loss_dict['expr_loss']:.4f})",
+                    f"Time: {metrics.step_time_ms:.1f}ms/step",
+                    f"Throughput: {metrics.cells_per_sec:.0f} cells/sec",
+                ]
 
-        step += 1
+                # Add memory info for CUDA
+                if device.type == "cuda":
+                    log_parts.append(
+                        f"Memory: {metrics.peak_memory_gb:.2f}GB ({metrics.memory_utilization_pct:.0f}%)"
+                    )
+
+                logger.info(" | ".join(log_parts))
+                total_loss = 0.0
+
+            step += 1
 
     elapsed = time.time() - start_time
+    training_time_sec = sum(metrics._step_times) / 1000  # Convert ms to sec
 
     # Log final summary
     summary = metrics.summary()
@@ -462,7 +628,11 @@ def train(
     logger.info("Summary:")
     logger.info("  Avg step time: {:.1f}ms", summary["avg_step_time_ms"])
     logger.info(
-        "  Avg throughput: {:.0f} cells/sec",
+        "  Training throughput: {:.0f} cells/sec (excludes startup)",
+        summary["total_cells"] / training_time_sec if training_time_sec > 0 else 0,
+    )
+    logger.info(
+        "  Wall-clock throughput: {:.0f} cells/sec (includes startup)",
         summary["total_cells"] / elapsed if elapsed > 0 else 0,
     )
     logger.info("  Total cells processed: {:,}", summary["total_cells"])
