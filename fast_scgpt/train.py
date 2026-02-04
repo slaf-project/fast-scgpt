@@ -231,6 +231,7 @@ def train_step(
     use_amp: bool = True,
     gradient_accumulation_steps: int = 1,
     is_accumulation_boundary: bool = True,
+    profile: bool = False,
 ) -> dict[str, float]:
     """Execute a single training step with gradient accumulation support.
 
@@ -244,11 +245,17 @@ def train_step(
         use_amp: Whether to use automatic mixed precision
         gradient_accumulation_steps: Number of steps to accumulate gradients
         is_accumulation_boundary: If True, perform optimizer step after backward
+        profile: If True, return timing breakdown for each phase
 
     Returns:
-        dict with loss values
+        dict with loss values (and timing_* keys if profile=True)
     """
     model.train()
+
+    # Profiling setup
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_start = time.perf_counter()
 
     # Move batch to device
     input_ids = batch["input_ids"].to(device)
@@ -258,6 +265,10 @@ def train_step(
     input_ids = clip_expression_tokens(
         input_ids, config.vocab_size, config.n_expression_bins
     )
+
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_data = time.perf_counter()
 
     # Create masking
     masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
@@ -269,6 +280,10 @@ def train_step(
         expr_token_offset=config.expr_token_offset,
         mask_ratio=0.15,
     )
+
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_mask = time.perf_counter()
 
     # Forward pass with mixed precision
     amp_dtype = (
@@ -289,21 +304,57 @@ def train_step(
         # Scale loss for gradient accumulation
         loss = loss_dict["loss"] / gradient_accumulation_steps
 
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_forward = time.perf_counter()
+
     # Backward pass with gradient scaling
     if scaler is not None and use_autocast:
         scaler.scale(loss).backward()
         if is_accumulation_boundary:
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_backward = time.perf_counter()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_optim = time.perf_counter()
+        else:
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_backward = time.perf_counter()
+                t_optim = t_backward  # No optimizer step
     else:
         loss.backward()
         if is_accumulation_boundary:
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_backward = time.perf_counter()
             optimizer.step()
             optimizer.zero_grad()
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_optim = time.perf_counter()
+        else:
+            if profile and device.type == "cuda":
+                torch.cuda.synchronize(device)
+                t_backward = time.perf_counter()
+                t_optim = t_backward  # No optimizer step
 
     # Return unscaled loss for logging
-    return {k: v.item() for k, v in loss_dict.items()}
+    result = {k: v.item() for k, v in loss_dict.items()}
+
+    # Add timing breakdown if profiling
+    if profile and device.type == "cuda":
+        result["timing_data_ms"] = (t_data - t_start) * 1000
+        result["timing_mask_ms"] = (t_mask - t_data) * 1000
+        result["timing_forward_ms"] = (t_forward - t_mask) * 1000
+        result["timing_backward_ms"] = (t_backward - t_forward) * 1000
+        result["timing_optim_ms"] = (t_optim - t_backward) * 1000
+
+    return result
 
 
 def train(
@@ -317,6 +368,7 @@ def train(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
 ) -> GPUMetrics:
     """Train ScGPT on SLAF data.
 
@@ -334,6 +386,7 @@ def train(
             activation memory by ~50% (trades compute for memory)
         use_compile: Use torch.compile for fused kernels and potential speedup
             (may increase compilation time on first step)
+        profile: Log timing breakdown (data/mask/forward/backward/optim)
 
     Returns:
         GPUMetrics with training statistics
@@ -575,6 +628,7 @@ def train(
             use_amp,
             gradient_accumulation_steps,
             is_accumulation_boundary,
+            profile=profile,
         )
 
         # Synchronize after step for accurate timing
@@ -614,6 +668,18 @@ def train(
                     )
 
                 logger.info(" | ".join(log_parts))
+
+                # Log timing breakdown if profiling
+                if profile and "timing_data_ms" in loss_dict:
+                    logger.info(
+                        "  Timing: data={:.1f}ms mask={:.1f}ms fwd={:.1f}ms bwd={:.1f}ms opt={:.1f}ms",
+                        loss_dict["timing_data_ms"],
+                        loss_dict["timing_mask_ms"],
+                        loss_dict["timing_forward_ms"],
+                        loss_dict["timing_backward_ms"],
+                        loss_dict["timing_optim_ms"],
+                    )
+
                 total_loss = 0.0
 
             step += 1

@@ -67,6 +67,7 @@ def train_on_modal(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
 ) -> dict:
     """Run training with GPU metrics on Modal.
 
@@ -81,6 +82,7 @@ def train_on_modal(
             Effective batch = batch_size * gradient_accumulation_steps
         use_gradient_checkpointing: Trade compute for ~50% activation memory savings
         use_compile: Use torch.compile for fused kernels (may speed up training)
+        profile: Log timing breakdown (data/mask/forward/backward/optim)
 
     Returns:
         dict with training summary metrics
@@ -118,7 +120,7 @@ def train_on_modal(
     # slaf_path = "hf://datasets/slaf-project/Tahoe-100M/data/train"
 
     # SLAF dataset path from S3
-    slaf_path = "s3://slaf-datasets/Tahoe100M_test_SLAF"
+    slaf_path = "s3://slaf-datasets/Tahoe100M_train_SLAF"
 
     logger.info(f"SLAF path: {slaf_path}")
 
@@ -187,6 +189,7 @@ def train_on_modal(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        profile=profile,
     )
 
     # Build results dict
@@ -239,6 +242,7 @@ def main(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
 ) -> None:
     """Run training benchmark from local machine.
 
@@ -252,6 +256,7 @@ def main(
         gradient_accumulation_steps: Effective batch = batch_size * this
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
+        profile: Log timing breakdown per step
     """
     effective_batch = batch_size * gradient_accumulation_steps
     print("Launching fast-scGPT training on Modal GPU...")
@@ -261,6 +266,7 @@ def main(
     print(f"  effective_batch_size={effective_batch}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
+    print(f"  profile={profile}")
     print()
 
     result = train_on_modal.remote(
@@ -273,6 +279,7 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        profile=profile,
     )
 
     print()
