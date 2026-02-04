@@ -552,6 +552,15 @@ def train(
     first_loss = None
     last_loss = None
 
+    # Accumulated timing across micro-steps (reset after each optimizer step)
+    accum_dl_ms = 0.0
+    accum_data_ms = 0.0
+    accum_mask_ms = 0.0
+    accum_fwd_ms = 0.0
+    accum_bwd_ms = 0.0
+    accum_optim_ms = 0.0
+    accum_step_ms = 0.0
+
     # Initialize gradients
     optimizer.zero_grad()
 
@@ -646,6 +655,16 @@ def train(
         step_end = time.perf_counter()
         step_time_ms = (step_end - step_start) * 1000
 
+        # Accumulate timing across micro-steps
+        accum_dl_ms += dataloader_time_ms
+        accum_step_ms += step_time_ms
+        if profile and "timing_data_ms" in loss_dict:
+            accum_data_ms += loss_dict["timing_data_ms"]
+            accum_mask_ms += loss_dict["timing_mask_ms"]
+            accum_fwd_ms += loss_dict["timing_forward_ms"]
+            accum_bwd_ms += loss_dict["timing_backward_ms"]
+            accum_optim_ms += loss_dict["timing_optim_ms"]
+
         # Accumulate loss (train_step returns unscaled loss)
         total_loss += loss_dict["loss"]
         last_loss = loss_dict["loss"]
@@ -656,8 +675,8 @@ def train(
         if is_accumulation_boundary:
             micro_step = 0  # Reset for next accumulation window
 
-            # Update metrics with effective batch size
-            metrics.update(step_time_ms, effective_batch_size, seq_len, device)
+            # Update metrics with TOTAL time for all micro-steps
+            metrics.update(accum_step_ms, effective_batch_size, seq_len, device)
 
             if (step + 1) % log_every == 0:
                 avg_loss = total_loss / (log_every * gradient_accumulation_steps)
@@ -678,27 +697,37 @@ def train(
 
                 logger.info(" | ".join(log_parts))
 
-                # Log timing breakdown if profiling
-                if profile and "timing_data_ms" in loss_dict:
+                # Log timing breakdown if profiling (accumulated across micro-steps)
+                if profile and accum_fwd_ms > 0:
                     compute_total = (
-                        loss_dict["timing_data_ms"]
-                        + loss_dict["timing_mask_ms"]
-                        + loss_dict["timing_forward_ms"]
-                        + loss_dict["timing_backward_ms"]
-                        + loss_dict["timing_optim_ms"]
+                        accum_data_ms
+                        + accum_mask_ms
+                        + accum_fwd_ms
+                        + accum_bwd_ms
+                        + accum_optim_ms
                     )
                     logger.info(
-                        "  Timing: dl={:.1f}ms | data={:.1f}ms mask={:.1f}ms fwd={:.1f}ms bwd={:.1f}ms opt={:.1f}ms | total={:.1f}ms",
-                        dataloader_time_ms,
-                        loss_dict["timing_data_ms"],
-                        loss_dict["timing_mask_ms"],
-                        loss_dict["timing_forward_ms"],
-                        loss_dict["timing_backward_ms"],
-                        loss_dict["timing_optim_ms"],
-                        dataloader_time_ms + compute_total,
+                        "  Timing ({}x accum): dl={:.0f}ms | data={:.0f}ms mask={:.0f}ms fwd={:.0f}ms bwd={:.0f}ms opt={:.0f}ms | total={:.0f}ms",
+                        gradient_accumulation_steps,
+                        accum_dl_ms,
+                        accum_data_ms,
+                        accum_mask_ms,
+                        accum_fwd_ms,
+                        accum_bwd_ms,
+                        accum_optim_ms,
+                        accum_dl_ms + compute_total,
                     )
 
                 total_loss = 0.0
+
+            # Reset accumulators for next optimizer step
+            accum_dl_ms = 0.0
+            accum_data_ms = 0.0
+            accum_mask_ms = 0.0
+            accum_fwd_ms = 0.0
+            accum_bwd_ms = 0.0
+            accum_optim_ms = 0.0
+            accum_step_ms = 0.0
 
             step += 1
 
