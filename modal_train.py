@@ -30,12 +30,8 @@ app = modal.App("fast-scgpt-benchmark")
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
 # Build image with CUDA + dependencies
-# Use CUDA base image for flash-attn compilation
 image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:12.4.0-devel-ubuntu22.04",
-        add_python="3.12",
-    )
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install(
         "torch>=2.0",
@@ -48,13 +44,12 @@ image = (
         "s3fs>=2024.2",
         "packaging",
         "ninja",
-        "wheel",
-        "setuptools",
         "slafdb",
     )
-    # Flash Attention 2 - build from source with CUDA
-    .run_commands(
-        "pip install flash-attn --no-build-isolation",
+    # Flash Attention 2 - build on GPU instance (more memory, correct CUDA)
+    .pip_install(
+        "flash-attn>=2.5",
+        gpu="a100",  # Use GPU builder to avoid OOM and get correct CUDA
     )
     # Copy local fast_scgpt package
     .add_local_dir("fast_scgpt", "/root/fast_scgpt")
