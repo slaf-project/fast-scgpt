@@ -154,15 +154,35 @@ def train_step_distributed(
         t_mask = time.perf_counter()
 
     # Forward pass with Accelerator's autocast
+    # Call model() directly (goes through DDP wrapper for gradient sync)
+    # Then compute loss manually (can't use compute_loss as it's not on DDP wrapper)
     with accelerator.autocast():
-        loss_dict = model.compute_loss(
-            masked_input_ids,
-            attention_mask,
-            gene_targets,
-            expr_targets,
-            gene_mask,
+        outputs = model(masked_input_ids, attention_mask)
+
+        # Gene loss: only on masked gene positions
+        gene_logits = outputs["gene_logits"]
+        gene_loss = torch.nn.functional.cross_entropy(
+            gene_logits[gene_mask],
+            gene_targets[gene_mask],
+            ignore_index=-100,
         )
-        loss = loss_dict["loss"]
+
+        # Expression loss: predict expression at expr position (gene_pos + 1)
+        expr_logits = outputs["expr_logits"]
+        expr_mask = torch.zeros_like(gene_mask)
+        expr_mask[:, 1:] = gene_mask[:, :-1]
+
+        valid_gene_mask = gene_mask.clone()
+        valid_gene_mask[:, -1] = False
+
+        expr_loss = torch.nn.functional.cross_entropy(
+            expr_logits[expr_mask],
+            expr_targets[valid_gene_mask],
+            ignore_index=-100,
+        )
+
+        loss = gene_loss + expr_loss
+        loss_dict = {"loss": loss, "gene_loss": gene_loss, "expr_loss": expr_loss}
 
     if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
