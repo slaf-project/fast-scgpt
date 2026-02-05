@@ -159,33 +159,25 @@ def create_mask(
     # Store targets before masking
     gene_targets[mask_positions] = input_ids[mask_positions]
 
-    # Get corresponding expression targets (position + 1)
-    for b in range(batch_size):
-        gene_pos = mask_positions[b].nonzero(as_tuple=True)[0]
-        expr_pos = gene_pos + 1
-        valid_expr_pos = expr_pos < seq_len
-        expr_pos = expr_pos[valid_expr_pos]
-        gene_pos_valid = gene_pos[valid_expr_pos]
+    # Get corresponding expression positions (gene_pos + 1) - VECTORIZED
+    # Shift mask_positions right by 1 to get expression positions
+    expr_positions = torch.zeros_like(mask_positions)
+    expr_positions[:, 1:] = mask_positions[:, :-1]  # Shift right
+    # Ensure we don't go past sequence end (already handled by shift)
 
-        if len(expr_pos) > 0:
-            # Expression tokens are at expr_token_offset + bin_id
-            # We need to extract the bin_id as the target
-            expr_tokens = input_ids[b, expr_pos]
-            expr_targets[b, gene_pos_valid] = expr_tokens - expr_token_offset
+    # Extract expression targets (vectorized)
+    # Expression tokens are at expr_token_offset + bin_id
+    expr_tokens = input_ids.clone()
+    expr_targets_raw = expr_tokens - expr_token_offset
+    # Only set targets where we have valid expression positions
+    expr_targets[mask_positions] = expr_targets_raw[expr_positions]
 
     # Apply masking to input
     # For genes: replace with [MASK]
     masked_input_ids[mask_positions] = mask_token_id
 
-    # For expressions: also replace with [MASK] or zero
-    # (We'll mask expression positions corresponding to masked genes)
-    for b in range(batch_size):
-        gene_pos = mask_positions[b].nonzero(as_tuple=True)[0]
-        expr_pos = gene_pos + 1
-        valid_expr_pos = expr_pos < seq_len
-        expr_pos = expr_pos[valid_expr_pos]
-        if len(expr_pos) > 0:
-            masked_input_ids[b, expr_pos] = mask_token_id
+    # For expressions: also replace with [MASK] (vectorized)
+    masked_input_ids[expr_positions] = mask_token_id
 
     return masked_input_ids, gene_targets, expr_targets, mask_positions
 
