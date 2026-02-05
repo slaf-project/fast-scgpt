@@ -141,10 +141,8 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     """Position-wise feed-forward network.
 
-    Uses ReLU² (squared ReLU) activation from modded-nanogpt:
-    - Sparser activations than GELU (many exact zeros)
-    - Computationally cheaper (no exp/erf)
-    - Better gradient flow through non-zero activations
+    Uses GELU activation. ReLU² was tested but causes regression with
+    Flash Attention due to unfused intermediate tensors.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -163,7 +161,7 @@ class FeedForward(nn.Module):
             Output of shape (batch, seq_len, d_model)
         """
         x = self.fc1(x)
-        x = F.relu(x).square()  # ReLU² from modded-nanogpt
+        x = F.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
         return x
