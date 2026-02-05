@@ -146,17 +146,14 @@ def train_distributed_on_modal(
     # Memory optimization
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # Build accelerate launch command
+    # Build torchrun command for native DDP
     num_gpus = torch.cuda.device_count()
     cmd = [
-        "accelerate",
-        "launch",
-        "--num_processes",
+        "torchrun",
+        "--nproc_per_node",
         str(num_gpus),
-        "--mixed_precision",
-        "bf16",
         "-m",
-        "fast_scgpt.train_distributed",
+        "fast_scgpt.train_ddp",
         "--slaf_path",
         slaf_path,
         "--n_steps",
@@ -175,10 +172,8 @@ def train_distributed_on_modal(
 
     if use_gradient_checkpointing:
         cmd.append("--use_gradient_checkpointing")
-    if use_compile:
-        cmd.append("--use_compile")
-    if profile:
-        cmd.append("--profile")
+    # Note: use_compile and profile not yet implemented in train_ddp.py
+    _ = use_compile, profile  # Silence unused warnings
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")
