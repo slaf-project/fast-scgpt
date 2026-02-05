@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 
 import torch
+import torch._dynamo
 from accelerate import Accelerator
 from loguru import logger
 
@@ -319,10 +320,13 @@ def train_distributed(
     if is_main:
         logger.info(f"Model parameters: {model.num_parameters:,}")
 
-    # Optional torch.compile
+    # Optional torch.compile - disable DDP optimizer to avoid higher-order op issues
     if use_compile and accelerator.device.type == "cuda":
         if is_main:
-            logger.info("Compiling model with torch.compile...")
+            logger.info(
+                "Compiling model with torch.compile (DDP optimizer disabled)..."
+            )
+        torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
 
     # Create optimizer
