@@ -103,6 +103,7 @@ def train_step_distributed(
     optimizer: torch.optim.Optimizer,
     accelerator: Accelerator,
     config: ModelConfig,
+    profile: bool = False,
 ) -> dict[str, float]:
     """Execute a single distributed training step.
 
@@ -112,11 +113,18 @@ def train_step_distributed(
         optimizer: The optimizer (wrapped by Accelerator)
         accelerator: HuggingFace Accelerator instance
         config: Model configuration
+        profile: If True, return timing breakdown for each phase
 
     Returns:
-        dict with loss values
+        dict with loss values (and timing_* keys if profile=True)
     """
     model.train()
+    device = accelerator.device
+
+    # Profiling setup
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_start = time.perf_counter()
 
     # Batch is already on correct device via Accelerator
     input_ids = batch["input_ids"]
@@ -126,6 +134,10 @@ def train_step_distributed(
     input_ids = clip_expression_tokens(
         input_ids, config.vocab_size, config.n_expression_bins
     )
+
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_data = time.perf_counter()
 
     # Create masking
     masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
@@ -138,6 +150,10 @@ def train_step_distributed(
         mask_ratio=0.15,
     )
 
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_mask = time.perf_counter()
+
     # Forward pass with Accelerator's autocast
     with accelerator.autocast():
         loss_dict = model.compute_loss(
@@ -149,14 +165,36 @@ def train_step_distributed(
         )
         loss = loss_dict["loss"]
 
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_forward = time.perf_counter()
+
     # Backward pass - Accelerator handles gradient sync
     accelerator.backward(loss)
+
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_backward = time.perf_counter()
 
     # Optimizer step
     optimizer.step()
     optimizer.zero_grad()
 
-    return {k: v.item() for k, v in loss_dict.items()}
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        t_optim = time.perf_counter()
+
+    result = {k: v.item() for k, v in loss_dict.items()}
+
+    # Add timing breakdown if profiling
+    if profile and device.type == "cuda":
+        result["timing_data_ms"] = (t_data - t_start) * 1000
+        result["timing_mask_ms"] = (t_mask - t_data) * 1000
+        result["timing_forward_ms"] = (t_forward - t_mask) * 1000
+        result["timing_backward_ms"] = (t_backward - t_forward) * 1000
+        result["timing_optim_ms"] = (t_optim - t_backward) * 1000
+
+    return result
 
 
 def train_distributed(
@@ -169,6 +207,7 @@ def train_distributed(
     log_every: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
 ) -> DistributedMetrics:
     """Train ScGPT on SLAF data with distributed data parallelism.
 
@@ -182,6 +221,7 @@ def train_distributed(
         log_every: Log every N steps
         use_gradient_checkpointing: Enable gradient checkpointing
         use_compile: Use torch.compile for fused kernels
+        profile: Log timing breakdown (data/mask/forward/backward/optim)
 
     Returns:
         DistributedMetrics with training statistics
@@ -356,7 +396,9 @@ def train_distributed(
         step_start = time.perf_counter()
 
         # Training step
-        loss_dict = train_step_distributed(model, batch, optimizer, accelerator, config)
+        loss_dict = train_step_distributed(
+            model, batch, optimizer, accelerator, config, profile=profile
+        )
 
         # Synchronize after step
         if accelerator.device.type == "cuda":
@@ -392,6 +434,18 @@ def train_distributed(
                 )
 
             logger.info(" | ".join(log_parts))
+
+            # Log timing breakdown if profiling
+            if profile and "timing_forward_ms" in loss_dict:
+                logger.info(
+                    "  Timing: data={:.0f}ms mask={:.0f}ms fwd={:.0f}ms bwd={:.0f}ms opt={:.0f}ms",
+                    loss_dict["timing_data_ms"],
+                    loss_dict["timing_mask_ms"],
+                    loss_dict["timing_forward_ms"],
+                    loss_dict["timing_backward_ms"],
+                    loss_dict["timing_optim_ms"],
+                )
+
             total_loss = 0.0
 
     # Final summary
@@ -484,6 +538,11 @@ def main() -> None:
         action="store_true",
         help="Use torch.compile",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Log timing breakdown (data/mask/forward/backward/optim)",
+    )
 
     args = parser.parse_args()
 
@@ -505,6 +564,7 @@ def main() -> None:
         log_every=args.log_every,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_compile=args.use_compile,
+        profile=args.profile,
     )
 
 

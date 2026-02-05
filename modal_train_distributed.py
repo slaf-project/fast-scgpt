@@ -69,6 +69,7 @@ def train_distributed_on_modal(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
     """Run distributed training on 8x H100 Modal.
@@ -82,6 +83,7 @@ def train_distributed_on_modal(
         model_size: Model size preset (small/base/large)
         use_gradient_checkpointing: Trade compute for ~50% activation memory savings
         use_compile: Use torch.compile for fused kernels
+        profile: Log timing breakdown (data/mask/forward/backward/optim)
         data_source: Data source - "s3", "volume", or "hf"
 
     Returns:
@@ -175,6 +177,8 @@ def train_distributed_on_modal(
         cmd.append("--use_gradient_checkpointing")
     if use_compile:
         cmd.append("--use_compile")
+    if profile:
+        cmd.append("--profile")
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -237,6 +241,7 @@ def main(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    profile: bool = False,
     data_source: str = "s3",
 ) -> None:
     """Run distributed training benchmark from local machine.
@@ -250,6 +255,7 @@ def main(
         model_size: small/base/large (default: base)
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
+        profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
     """
     # Estimate effective batch size
@@ -262,6 +268,7 @@ def main(
     print(f"  model_size={model_size}, lr={learning_rate}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
+    print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print()
 
@@ -274,6 +281,7 @@ def main(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        profile=profile,
         data_source=data_source,
     )
 
