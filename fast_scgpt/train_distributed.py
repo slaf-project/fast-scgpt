@@ -14,7 +14,6 @@ Usage (Modal):
 """
 
 import argparse
-import itertools
 import time
 from dataclasses import dataclass, field
 
@@ -257,17 +256,31 @@ def train_distributed(
         logger.error("SLAF not installed. Install with: pip install slafdb")
         raise ImportError("slafdb required for training") from e
 
+    # Only rank 0 loads data - SLAFDataLoader doesn't support distributed sampling
+    # We'll broadcast batches from rank 0 to all other ranks
+    slaf_array = None
+    base_dataloader = None
+
     if is_main:
         logger.info(f"Loading SLAF data from: {slaf_path}")
-
-    t0 = time.time()
-    slaf_array = SLAFArray(slaf_path)
-
-    if is_main:
+        t0 = time.time()
+        slaf_array = SLAFArray(slaf_path)
         logger.info(f"SLAFArray loaded in {time.time() - t0:.2f}s")
 
-    # Get vocab_size from SLAF metadata
-    num_genes = slaf_array.shape[1]
+    # Broadcast vocab info from rank 0 to all ranks
+    if is_main:
+        num_genes = slaf_array.shape[1]  # type: ignore[union-attr]
+        vocab_info = torch.tensor([num_genes], device=accelerator.device)
+    else:
+        vocab_info = torch.zeros(1, dtype=torch.long, device=accelerator.device)
+
+    # Broadcast vocab_info from rank 0
+    import torch.distributed as dist
+
+    dist.broadcast(vocab_info, src=0)
+    num_genes = int(vocab_info[0].item())
+
+    # All ranks can now configure the model
     vocab_size = 4 + num_genes
     config.vocab_size = vocab_size
     config._expr_token_offset = vocab_size
@@ -300,22 +313,21 @@ def train_distributed(
         betas=(0.9, 0.95),
     )
 
-    # Create dataloader with distributed sampler
-    # SLAFDataLoader handles its own batching, so we wrap it
-    t0 = time.time()
-    base_dataloader = SLAFDataLoader(
-        slaf_array=slaf_array,
-        tokenizer_type="scgpt",
-        batch_size=batch_size,
-        max_genes=max_genes,
-        n_expression_bins=config.n_expression_bins,
-        vocab_size=vocab_size,
-        use_mixture_of_scanners=True,
-        prefetch_batch_size=512000,
-        verbose=False,
-    )
-
+    # Create dataloader only on rank 0 - we'll broadcast batches to other ranks
+    # SLAFDataLoader doesn't support DistributedSampler
     if is_main:
+        t0 = time.time()
+        base_dataloader = SLAFDataLoader(
+            slaf_array=slaf_array,  # type: ignore[arg-type]
+            tokenizer_type="scgpt",
+            batch_size=batch_size,
+            max_genes=max_genes,
+            n_expression_bins=config.n_expression_bins,
+            vocab_size=vocab_size,
+            use_mixture_of_scanners=True,
+            prefetch_batch_size=512000,
+            verbose=False,
+        )
         logger.info(f"SLAFDataLoader created in {time.time() - t0:.2f}s")
 
     # Prepare model, optimizer with Accelerator
@@ -340,37 +352,61 @@ def train_distributed(
         )
         logger.info(f"Max genes: {max_genes}, Seq len: {seq_len}")
 
-    # Pre-fetch first batch with retry
+    # Pre-fetch first batch with retry (only on rank 0)
+    dataloader_iter = None
     if is_main:
         logger.info("Pre-fetching first batch...")
+        max_retries = 3
+        last_error = None
 
-    max_retries = 3
-    first_batch = None
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            dataloader_iter = iter(base_dataloader)
-            first_batch = next(dataloader_iter)
-            if is_main:
+        for attempt in range(max_retries):
+            try:
+                dataloader_iter = iter(base_dataloader)  # type: ignore[arg-type]
+                first_batch_cpu = next(dataloader_iter)
                 logger.info(
-                    f"First batch received (shape: {first_batch['input_ids'].shape})"
+                    f"First batch received (shape: {first_batch_cpu['input_ids'].shape})"
                 )
-            break
-        except Exception as e:
-            last_error = str(e)
-            if is_main:
+                break
+            except Exception as e:
+                last_error = str(e)
                 logger.warning(f"Attempt {attempt + 1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2**attempt)
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)
+        else:
+            raise RuntimeError(
+                f"Dataloader failed after {max_retries} retries: {last_error}"
+            )
 
-    if first_batch is None:
-        raise RuntimeError(
-            f"Dataloader failed after {max_retries} retries: {last_error}"
-        )
+    # Synchronize all ranks before training
+    accelerator.wait_for_everyone()
 
-    # Move first batch to device
-    first_batch = {k: v.to(accelerator.device) for k, v in first_batch.items()}
+    # Helper to broadcast batch from rank 0 to all ranks
+    def broadcast_batch(
+        batch_cpu: dict[str, torch.Tensor] | None,
+    ) -> dict[str, torch.Tensor]:
+        """Broadcast batch tensors from rank 0 to all ranks."""
+        device = accelerator.device
+
+        if is_main:
+            assert batch_cpu is not None
+            input_ids = batch_cpu["input_ids"].to(device)
+            attention_mask = batch_cpu["attention_mask"].to(device)
+            # Broadcast shape first
+            shape = torch.tensor(input_ids.shape, device=device)
+        else:
+            shape = torch.zeros(2, dtype=torch.long, device=device)
+
+        dist.broadcast(shape, src=0)
+        batch_shape = tuple(shape.tolist())
+
+        if not is_main:
+            input_ids = torch.zeros(batch_shape, dtype=torch.long, device=device)
+            attention_mask = torch.zeros(batch_shape, dtype=torch.long, device=device)
+
+        dist.broadcast(input_ids, src=0)
+        dist.broadcast(attention_mask, src=0)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     # Training loop
     step = 0
@@ -380,15 +416,35 @@ def train_distributed(
     last_loss = None
 
     optimizer.zero_grad()
-    batches = itertools.chain([first_batch], dataloader_iter)
 
-    for batch in batches:
-        if step >= n_steps:
+    # Main training loop - rank 0 loads, broadcasts to all
+    while step < n_steps:
+        # Rank 0 loads next batch, others wait
+        batch_cpu = None
+        if is_main:
+            try:
+                if step == 0:
+                    batch_cpu = first_batch_cpu  # type: ignore[possibly-undefined]
+                else:
+                    batch_cpu = next(dataloader_iter)  # type: ignore[arg-type]
+            except StopIteration:
+                logger.warning(f"Dataloader exhausted at step {step}")
+                # Signal other ranks that we're done
+                done_signal = torch.tensor([1], device=accelerator.device)
+                dist.broadcast(done_signal, src=0)
+                break
+
+        # Check if rank 0 signaled done
+        if is_main:
+            done_signal = torch.tensor([0], device=accelerator.device)
+        else:
+            done_signal = torch.zeros(1, dtype=torch.long, device=accelerator.device)
+        dist.broadcast(done_signal, src=0)
+        if done_signal[0].item() == 1:
             break
 
-        # Move batch to device (first batch already moved)
-        if step > 0:
-            batch = {k: v.to(accelerator.device) for k, v in batch.items()}
+        # Broadcast batch from rank 0 to all ranks
+        batch = broadcast_batch(batch_cpu)
 
         # Synchronize for timing
         if accelerator.device.type == "cuda":
