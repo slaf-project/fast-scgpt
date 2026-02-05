@@ -1,7 +1,8 @@
-"""Minimal transformer model for scGPT-style single-cell data.
+"""Transformer model for scGPT-style single-cell data.
 
-Phase 1: Simple architecture with standard components.
-Phase 2 will add QK-Norm, ReLU², RMSNorm, and custom attention masking.
+Architecture innovations from modded-nanogpt:
+- RMSNorm: Faster normalization without learnable parameters
+- Phase 2 will add QK-Norm and ReLU²
 """
 
 import math
@@ -13,6 +14,7 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
 from fast_scgpt.config import ModelConfig
+from fast_scgpt.norms import RMSNorm
 
 
 class TokenEmbedding(nn.Module):
@@ -165,9 +167,7 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm architecture.
 
-    Phase 1: Standard LayerNorm.
-    Phase 2 will use RMSNorm without learnable parameters.
-
+    Uses RMSNorm (no learnable parameters) for faster normalization.
     Supports gradient checkpointing for memory efficiency during training.
     """
 
@@ -175,8 +175,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = MultiHeadAttention(config)
         self.ff = FeedForward(config)
-        self.ln1 = nn.LayerNorm(config.d_model)  # Phase 2: RMSNorm
-        self.ln2 = nn.LayerNorm(config.d_model)  # Phase 2: RMSNorm
+        self.norm1 = RMSNorm(config.d_model)
+        self.norm2 = RMSNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
         self.use_checkpoint = use_checkpoint
 
@@ -187,9 +187,9 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         """Core forward implementation."""
         # Pre-norm attention
-        x = x + self.dropout(self.attention(self.ln1(x), attention_mask))
+        x = x + self.dropout(self.attention(self.norm1(x), attention_mask))
         # Pre-norm feed-forward
-        x = x + self.dropout(self.ff(self.ln2(x)))
+        x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
     def forward(
@@ -250,7 +250,7 @@ class ScGPT(nn.Module):
         )
 
         # Final layer norm
-        self.ln_f = nn.LayerNorm(config.d_model)
+        self.norm_f = RMSNorm(config.d_model)
 
         # Output heads
         # Gene prediction: predict masked gene tokens
@@ -273,9 +273,7 @@ class ScGPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
+        # RMSNorm has no learnable parameters, no initialization needed
 
     def forward(
         self,
@@ -304,7 +302,7 @@ class ScGPT(nn.Module):
             x = block(x, attention_mask)
 
         # Final layer norm
-        x = self.ln_f(x)
+        x = self.norm_f(x)
 
         # Output heads
         gene_logits = self.gene_head(x)
