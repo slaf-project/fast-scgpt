@@ -54,7 +54,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu="H100",
     timeout=7200,  # 2 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -199,8 +199,9 @@ def train_on_modal(
         profile=profile,
     )
 
-    # Build results dict
+    # Build results dict (median excludes first batch warmup)
     summary = metrics.summary()
+    median_ms = summary["median_step_time_ms"]
     result = {
         "status": "success",
         "n_steps": n_steps,
@@ -208,10 +209,9 @@ def train_on_modal(
         "max_genes": max_genes,
         "model_size": model_size,
         "avg_step_time_ms": summary["avg_step_time_ms"],
-        "avg_cells_per_sec": (
-            summary["total_cells"] / (summary["avg_step_time_ms"] * n_steps / 1000)
-            if summary["avg_step_time_ms"] > 0
-            else 0
+        "median_step_time_ms": median_ms,
+        "median_cells_per_sec": (
+            batch_size / (median_ms / 1000) if median_ms > 0 else 0
         ),
         "total_cells": summary["total_cells"],
         "total_tokens": summary["total_tokens"],
@@ -305,9 +305,10 @@ def main(
         print(f"Max genes: {result['max_genes']}")
         print(f"Model size: {result['model_size']}")
         print()
-        print("Performance:")
+        print("Performance (excludes first batch warmup):")
+        print(f"  Median step time: {result['median_step_time_ms']:.1f} ms")
         print(f"  Avg step time: {result['avg_step_time_ms']:.1f} ms")
-        print(f"  Avg throughput: {result['avg_cells_per_sec']:.0f} cells/sec")
+        print(f"  Throughput: {result['median_cells_per_sec']:.0f} cells/sec")
         print(f"  Total cells: {result['total_cells']:,}")
         print(f"  Total tokens: {result['total_tokens']:,}")
         print()

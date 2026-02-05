@@ -74,12 +74,19 @@ class GPUMetrics:
             self.memory_utilization_pct = (self.peak_memory_gb / total_memory) * 100
 
     def summary(self) -> dict[str, float]:
-        """Return summary statistics."""
-        avg_step_time = (
-            sum(self._step_times) / len(self._step_times) if self._step_times else 0
-        )
+        """Return summary statistics.
+
+        Excludes first batch (warmup) and reports median for robustness.
+        """
+        # Exclude first batch (warmup/compilation)
+        times = self._step_times[1:] if len(self._step_times) > 1 else self._step_times
+
+        avg_step_time = sum(times) / len(times) if times else 0
+        median_step_time = sorted(times)[len(times) // 2] if times else 0
+
         return {
             "avg_step_time_ms": avg_step_time,
+            "median_step_time_ms": median_step_time,
             "total_cells": self._cells_processed,
             "total_tokens": self._tokens_processed,
             "peak_memory_gb": self.peak_memory_gb,
