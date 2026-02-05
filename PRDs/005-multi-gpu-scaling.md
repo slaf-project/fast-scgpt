@@ -1,8 +1,44 @@
 # PRD: Multi-GPU Scaling (Phase 3)
 
 **Date:** 2026-02-05
-**Status:** Planning
+**Status:** Blocked
 **Prerequisite:** PRD-004 (Architecture Modernization) - Partially Complete
+
+---
+
+## Current Status (2026-02-05)
+
+**Blocked on:** NCCL communication issues in Modal multi-GPU environment.
+
+### What Was Implemented
+
+| File | Status | Description |
+|------|--------|-------------|
+| `fast_scgpt/train_distributed.py` | Created | Accelerate-based distributed training |
+| `fast_scgpt/train_ddp.py` | Created | Native PyTorch DDP training |
+| `modal_train_distributed.py` | Created | Modal wrapper for multi-GPU |
+
+### Issues Encountered
+
+1. **SLAFDataLoader lacks DistributedSampler support**
+   - Workaround: Rank 0 loads data, broadcasts to other ranks
+   - This limits true data-parallel scaling
+
+2. **torch.compile + DDP incompatibility**
+   - Higher-order ops cause NotImplementedError
+   - Workaround: Disable DDP optimizer or skip compile
+
+3. **NCCL timeouts on Modal**
+   - Broadcasts succeed initially, then hang after first training step
+   - Tried: HuggingFace Accelerate, native PyTorch DDP
+   - Both hit same NCCL timeout (WorkNCCL OpType=BROADCAST)
+   - Kernel version warning: 4.4.0 < 5.5.0 recommended
+
+### Next Steps
+
+1. **SLAF distributed dataloader** - Native support for sharding across ranks
+2. **Investigate Modal NCCL issues** - May be infrastructure-related
+3. **Test on different infrastructure** - AWS/GCP to isolate Modal issues
 
 ---
 
