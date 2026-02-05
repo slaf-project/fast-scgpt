@@ -26,15 +26,26 @@ except Exception as e:
 
 
 def check_flash_attn() -> bool:
-    """Check if Flash Attention is available and log status."""
+    """Check attention backend status and log."""
+    import torch.backends.cuda
+
+    # Log SDPA backend availability
+    if hasattr(torch.backends.cuda, "flash_sdp_enabled"):
+        logger.info(
+            f"SDPA flash backend available: {torch.backends.cuda.flash_sdp_enabled()}"
+        )
+        logger.info(
+            f"SDPA mem_efficient backend available: {torch.backends.cuda.mem_efficient_sdp_enabled()}"
+        )
+
     if FLASH_ATTN_AVAILABLE:
-        logger.info("Flash Attention 2 is available")
-        return True
+        logger.info("Flash Attention 2 package available (not used, SDPA preferred)")
     else:
-        logger.warning("Flash Attention not available, using PyTorch SDPA fallback")
+        logger.info("Using PyTorch SDPA (auto-selects best backend)")
         if FLASH_ATTN_ERROR:
-            logger.warning(f"Flash Attention import error: {FLASH_ATTN_ERROR}")
-        return False
+            logger.debug(f"flash_attn import note: {FLASH_ATTN_ERROR}")
+
+    return True  # We always have SDPA
 
 
 def attention(
