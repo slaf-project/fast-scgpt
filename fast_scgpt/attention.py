@@ -96,10 +96,13 @@ def attention_with_reshape(
     causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """Attention that handles tensor format differences between FA2 and SDPA.
+    """Attention using PyTorch SDPA.
 
-    Input tensors should be in SDPA format: (batch, nheads, seqlen, headdim)
-    This function will transpose for FA2 if needed.
+    SDPA automatically dispatches to the best backend (flash, memory-efficient, or math)
+    based on inputs and hardware. On A100, it uses flash attention internally.
+
+    The explicit flash_attn package requires format conversion that adds overhead,
+    so we use SDPA which handles this optimally.
 
     Args:
         q, k, v: Tensors of shape (batch, nheads, seqlen, headdim)
@@ -111,31 +114,14 @@ def attention_with_reshape(
     Returns:
         Output tensor of shape (batch, nheads, seqlen, headdim)
     """
-    if FLASH_ATTN_AVAILABLE and q.is_cuda and attn_mask is None:
-        # Transpose from (batch, nheads, seqlen, headdim) to (batch, seqlen, nheads, headdim)
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-
-        out: torch.Tensor = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=dropout_p if q.requires_grad else 0.0,
-            causal=causal,
-            softmax_scale=scale,
-        )
-
-        # Transpose back to (batch, nheads, seqlen, headdim)
-        return out.transpose(1, 2)
-    else:
-        # SDPA already expects (batch, nheads, seqlen, headdim)
-        return F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p if q.requires_grad else 0.0,
-            is_causal=causal,
-            scale=scale,
-        )
+    # SDPA auto-selects best backend (flash/mem-efficient/math)
+    # On A100 with no mask, it uses flash attention internally
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p if q.requires_grad else 0.0,
+        is_causal=causal,
+        scale=scale,
+    )
