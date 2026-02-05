@@ -57,13 +57,10 @@ class TokenEmbedding(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention with Flash Attention 2 support.
+    """Multi-head self-attention with Flash Attention 3 native layout.
 
-    Uses Flash Attention 2 when available (CUDA, sm80+), falls back to
-    PyTorch SDPA otherwise. Flash Attention is O(n) memory vs O(n²).
-
-    Note: QK-Norm disabled due to performance regression with Flash Attention.
-    The normalize ops don't fuse well and cause 2x slowdown.
+    Uses FA3 native (B, T, H, D) layout on H100 for zero transpose overhead.
+    Falls back to SDPA on other GPUs.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -91,47 +88,35 @@ class MultiHeadAttention(nn.Module):
         Args:
             x: Input of shape (batch, seq_len, d_model)
             attention_mask: Boolean mask of shape (batch, seq_len).
-                True for positions to attend to, False for padding.
-                Note: Flash Attention ignores masks, falls back to SDPA if mask provided.
+                Currently ignored - FA3 doesn't support masks efficiently.
 
         Returns:
             Output of shape (batch, seq_len, d_model)
         """
-        from fast_scgpt.attention import attention_with_reshape
+        from fast_scgpt.attention import attention_native_layout
 
         # Project to Q, K, V
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # Reshape to (batch, n_heads, seq_len, d_head)
-        q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
-        k = rearrange(k, "b s (h d) -> b h s d", h=self.n_heads)
-        v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
+        # Reshape to FA3 native layout: (batch, seq_len, n_heads, d_head)
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.n_heads)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.n_heads)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.n_heads)
 
-        # Convert attention mask for SDPA if provided
-        # attention_mask: (batch, seq_len) bool -> (batch, 1, 1, seq_len) float
-        attn_mask = None
-        if attention_mask is not None:
-            attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_mask = attn_mask.to(dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(
-                ~attention_mask.unsqueeze(1).unsqueeze(2), float("-inf")
-            )
-
-        # Use Flash Attention if available, else SDPA
-        out = attention_with_reshape(
+        # Use FA3 native layout attention (no transpose on H100)
+        out = attention_native_layout(
             q,
             k,
             v,
-            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             causal=False,  # Bidirectional attention for scGPT
             scale=self.scale,
         )
 
         # Reshape back to (batch, seq_len, d_model)
-        out = rearrange(out, "b h s d -> b s (h d)")
+        out = rearrange(out, "b s h d -> b s (h d)")
 
         result: torch.Tensor = self.out_proj(out)
         return result

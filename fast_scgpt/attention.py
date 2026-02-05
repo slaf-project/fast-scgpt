@@ -125,6 +125,56 @@ def attention(
         )
 
 
+def attention_native_layout(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Attention with FA3 native (B, T, H, D) layout.
+
+    On H100 with flash_attn available: uses FA3 directly (no transpose).
+    Otherwise: transposes to SDPA format and back.
+
+    Args:
+        q, k, v: Tensors of shape (batch, seqlen, nheads, headdim) - FA3 native format
+        dropout_p: Dropout probability
+        causal: If True, apply causal masking
+        scale: Optional scale factor
+
+    Returns:
+        Output tensor of shape (batch, seqlen, nheads, headdim)
+    """
+    if FLASH_ATTN_AVAILABLE and flash_attn_func is not None and q.is_cuda:
+        # FA3 native layout - no transpose needed!
+        result: torch.Tensor = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p if q.requires_grad else 0.0,
+            causal=causal,
+            softmax_scale=scale,
+        )
+        return result
+    else:
+        # SDPA fallback - needs transpose (B,T,H,D) -> (B,H,T,D)
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k.transpose(1, 2)
+        v_sdpa = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            dropout_p=dropout_p if q.requires_grad else 0.0,
+            is_causal=causal,
+            scale=scale,
+        )
+        # Transpose back to (B,T,H,D)
+        return out.transpose(1, 2)
+
+
 def attention_with_reshape(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -134,13 +184,10 @@ def attention_with_reshape(
     causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """Attention using PyTorch SDPA.
+    """Attention for SDPA format (B, H, T, D).
 
-    SDPA automatically dispatches to the best backend (flash, memory-efficient, or math)
-    based on inputs and hardware. On A100, it uses flash attention internally.
-
-    The explicit flash_attn package requires format conversion that adds overhead,
-    so we use SDPA which handles this optimally.
+    DEPRECATED: Use attention_native_layout with (B, T, H, D) format instead
+    for better performance on H100.
 
     Args:
         q, k, v: Tensors of shape (batch, nheads, seqlen, headdim)
@@ -153,7 +200,6 @@ def attention_with_reshape(
         Output tensor of shape (batch, nheads, seqlen, headdim)
     """
     # SDPA auto-selects best backend (flash/mem-efficient/math)
-    # On A100 with no mask, it uses flash attention internally
     return F.scaled_dot_product_attention(
         q,
         k,

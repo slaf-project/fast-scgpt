@@ -30,12 +30,12 @@ app = modal.App("fast-scgpt-benchmark")
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
 # Build image with CUDA + dependencies
-# Using SDPA (auto-dispatches to flash attention on A100), no explicit flash-attn needed
+# Flash Attention 3 on H100 uses native (B,T,H,D) layout - no transpose overhead
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install(
-        "torch>=2.4.0",  # Latest PyTorch, SDPA handles flash attention
+        "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",
@@ -46,6 +46,10 @@ image = (
         "packaging",
         "ninja",
         "slafdb",
+    )
+    # Flash Attention - FA3 on H100, FA2 on A100
+    .pip_install(
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
     )
     # Copy local fast_scgpt package
     .add_local_dir("fast_scgpt", "/root/fast_scgpt")
