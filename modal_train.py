@@ -46,10 +46,9 @@ image = (
         "ninja",
         "slafdb",
     )
-    # Flash Attention 2 - build on GPU instance (more memory, correct CUDA)
+    # Flash Attention 2 - prebuilt wheel for Python 3.12 + CUDA 12 + PyTorch 2.4
     .pip_install(
-        "flash-attn>=2.5",
-        gpu="a100",  # Use GPU builder to avoid OOM and get correct CUDA
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
     )
     # Copy local fast_scgpt package
     .add_local_dir("fast_scgpt", "/root/fast_scgpt")
