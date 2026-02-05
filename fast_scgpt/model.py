@@ -58,10 +58,12 @@ class TokenEmbedding(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention with Flash Attention 2 support.
+    """Multi-head self-attention with Flash Attention 2 and QK-Norm.
 
-    Uses Flash Attention 2 when available (CUDA, sm80+), falls back to
-    PyTorch SDPA otherwise. Flash Attention is O(n) memory vs O(n²).
+    Features:
+    - QK-Norm: Normalizes Q and K per-head for stable attention scores
+    - Flash Attention 2 when available (CUDA, sm80+), SDPA fallback
+    - O(n) memory with Flash Attention vs O(n²) standard
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -77,6 +79,8 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
 
+        # With QK-Norm, we use a fixed scale since Q/K are unit normalized
+        # The effective scale becomes sqrt(d_head) after normalization
         self.scale = 1.0 / math.sqrt(self.d_head)
 
     def forward(
@@ -84,7 +88,7 @@ class MultiHeadAttention(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute multi-head self-attention.
+        """Compute multi-head self-attention with QK-Norm.
 
         Args:
             x: Input of shape (batch, seq_len, d_model)
@@ -106,6 +110,11 @@ class MultiHeadAttention(nn.Module):
         q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
         k = rearrange(k, "b s (h d) -> b h s d", h=self.n_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
+
+        # QK-Norm: normalize Q and K per-head (along d_head dimension)
+        # This stabilizes attention scores and eliminates need for softcapping
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
 
         # Convert attention mask for SDPA if provided
         # attention_mask: (batch, seq_len) bool -> (batch, 1, 1, seq_len) float
