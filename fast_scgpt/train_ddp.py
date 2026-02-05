@@ -238,10 +238,7 @@ def train_ddp(
                 logger.warning(f"Dataloader exhausted at step {step}")
                 continue_signal[0] = 0
 
-        # Sync all ranks before broadcast
-        dist.barrier()
-
-        # Broadcast continue signal
+        # Broadcast continue signal (acts as sync point)
         dist.broadcast(continue_signal, src=0)
         if continue_signal[0].item() == 0:
             break
@@ -304,6 +301,9 @@ def train_ddp(
             first_loss = loss_val
 
         step += 1
+
+        # All ranks log completion (for debugging distributed hangs)
+        logger.debug(f"[Rank {rank}] Step {step} complete, going to load next batch")
 
         if is_main and step % log_every == 0:
             avg_loss = total_loss / log_every

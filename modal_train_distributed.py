@@ -147,10 +147,9 @@ def train_distributed_on_modal(
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # NCCL debugging
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
-    # Shorter timeout for faster debugging (60 sec instead of 600)
-    os.environ["NCCL_TIMEOUT"] = "60"
+    os.environ["NCCL_DEBUG"] = "WARN"  # Less verbose
+    # Longer timeout - S3 data loading can be slow
+    os.environ["NCCL_TIMEOUT"] = "300"
 
     # Build torchrun command for native DDP
     num_gpus = torch.cuda.device_count()
