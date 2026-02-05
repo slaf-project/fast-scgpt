@@ -14,7 +14,6 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
 from fast_scgpt.config import ModelConfig
-from fast_scgpt.norms import RMSNorm
 
 
 class TokenEmbedding(nn.Module):
@@ -170,7 +169,6 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm architecture.
 
-    Uses RMSNorm (no learnable parameters) for faster normalization.
     Supports gradient checkpointing for memory efficiency during training.
     """
 
@@ -178,8 +176,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = MultiHeadAttention(config)
         self.ff = FeedForward(config)
-        self.norm1 = RMSNorm(config.d_model)
-        self.norm2 = RMSNorm(config.d_model)
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.norm2 = nn.LayerNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
         self.use_checkpoint = use_checkpoint
 
@@ -253,7 +251,7 @@ class ScGPT(nn.Module):
         )
 
         # Final layer norm
-        self.norm_f = RMSNorm(config.d_model)
+        self.norm_f = nn.LayerNorm(config.d_model)
 
         # Output heads
         # Gene prediction: predict masked gene tokens
@@ -276,7 +274,9 @@ class ScGPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        # RMSNorm has no learnable parameters, no initialization needed
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
 
     def forward(
         self,
