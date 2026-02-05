@@ -159,25 +159,30 @@ def create_mask(
     # Store targets before masking
     gene_targets[mask_positions] = input_ids[mask_positions]
 
-    # Get corresponding expression positions (gene_pos + 1) - VECTORIZED
-    # Shift mask_positions right by 1 to get expression positions
-    expr_positions = torch.zeros_like(mask_positions)
-    expr_positions[:, 1:] = mask_positions[:, :-1]  # Shift right
-    # Ensure we don't go past sequence end (already handled by shift)
+    # Get corresponding expression targets (vectorized)
+    # For masked gene at position p, expression is at p+1
+    # We need to exclude genes at last position (no room for expression)
+    valid_gene_mask = mask_positions.clone()
+    valid_gene_mask[:, -1] = False  # Genes at last pos have no expr slot
 
-    # Extract expression targets (vectorized)
-    # Expression tokens are at expr_token_offset + bin_id
-    expr_tokens = input_ids.clone()
-    expr_targets_raw = expr_tokens - expr_token_offset
-    # Only set targets where we have valid expression positions
-    expr_targets[mask_positions] = expr_targets_raw[expr_positions]
+    # Shift input_ids left by 1 to align expression tokens with gene positions
+    # So expr_at_gene_pos[p] = input_ids[p+1]
+    expr_at_gene_pos = torch.zeros_like(input_ids)
+    expr_at_gene_pos[:, :-1] = input_ids[:, 1:]
+
+    # Extract expression bin targets (token - offset)
+    expr_bin_ids = expr_at_gene_pos - expr_token_offset
+    expr_targets[valid_gene_mask] = expr_bin_ids[valid_gene_mask]
 
     # Apply masking to input
     # For genes: replace with [MASK]
     masked_input_ids[mask_positions] = mask_token_id
 
-    # For expressions: also replace with [MASK] (vectorized)
-    masked_input_ids[expr_positions] = mask_token_id
+    # For expressions at gene_pos+1: also replace with [MASK]
+    # Shift mask right to get expression positions
+    expr_mask_positions = torch.zeros_like(mask_positions)
+    expr_mask_positions[:, 1:] = valid_gene_mask[:, :-1]
+    masked_input_ids[expr_mask_positions] = mask_token_id
 
     return masked_input_ids, gene_targets, expr_targets, mask_positions
 
