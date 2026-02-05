@@ -30,11 +30,12 @@ app = modal.App("fast-scgpt-benchmark")
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
 # Build image with CUDA + dependencies
+# Pin torch==2.4.* to match flash-attn wheel (built for torch2.4)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install(
-        "torch>=2.0",
+        "torch>=2.4.0,<2.5.0",  # Pin to 2.4.x for flash-attn compatibility
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",

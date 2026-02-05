@@ -12,12 +12,17 @@ from loguru import logger
 
 # Try to import Flash Attention 2
 FLASH_ATTN_AVAILABLE = False
+FLASH_ATTN_ERROR: str | None = None
 try:
     from flash_attn import flash_attn_func
 
     FLASH_ATTN_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     flash_attn_func = None
+    FLASH_ATTN_ERROR = str(e)
+except Exception as e:
+    flash_attn_func = None
+    FLASH_ATTN_ERROR = f"{type(e).__name__}: {e}"
 
 
 def check_flash_attn() -> bool:
@@ -27,6 +32,8 @@ def check_flash_attn() -> bool:
         return True
     else:
         logger.warning("Flash Attention not available, using PyTorch SDPA fallback")
+        if FLASH_ATTN_ERROR:
+            logger.warning(f"Flash Attention import error: {FLASH_ATTN_ERROR}")
         return False
 
 
