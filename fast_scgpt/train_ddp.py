@@ -227,11 +227,19 @@ def train_ddp(
         # Rank 0 loads batch
         batch_cpu = None
         if is_main:
+            logger.debug(f"Step {step}: Loading batch...")
+            load_start = time.perf_counter()
             try:
                 batch_cpu = next(dataloader_iter)  # type: ignore
+                logger.debug(
+                    f"Step {step}: Batch loaded in {time.perf_counter() - load_start:.2f}s"
+                )
             except StopIteration:
                 logger.warning(f"Dataloader exhausted at step {step}")
                 continue_signal[0] = 0
+
+        # Sync all ranks before broadcast
+        dist.barrier()
 
         # Broadcast continue signal
         dist.broadcast(continue_signal, src=0)

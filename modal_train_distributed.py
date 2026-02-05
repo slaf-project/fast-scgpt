@@ -55,7 +55,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="H100:8",  # 8x H100 in single node
+    gpu="H100:2",  # Start with 2x H100 to debug
     timeout=14400,  # 4 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -145,6 +145,12 @@ def train_distributed_on_modal(
 
     # Memory optimization
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # NCCL debugging
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
+    # Shorter timeout for faster debugging (60 sec instead of 600)
+    os.environ["NCCL_TIMEOUT"] = "60"
 
     # Build torchrun command for native DDP
     num_gpus = torch.cuda.device_count()
