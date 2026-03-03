@@ -41,6 +41,18 @@ class ModelConfig:
     dropout: float = 0.1
     bias: bool = False
 
+    # Weight tying
+    tie_weights: bool = False  # Share embedding and gene_head weights
+
+    # Feed-forward activation
+    use_swiglu: bool = False  # Use SwiGLU instead of GELU (Llama-style)
+
+    # Low-precision LayerNorm
+    use_lp_layernorm: bool = False  # Force LayerNorm to stay in bf16 (Tahoe-X1 style)
+
+    # Logit softcapping (nanochat optimization)
+    use_softcap: bool = False  # Apply tanh softcapping to prevent extreme logits
+
     # Special token IDs (must match SLAF tokenizer)
     pad_token_id: int = 0
     cls_token_id: int = 1
@@ -103,13 +115,40 @@ class ModelConfig:
 
     @classmethod
     def base(cls) -> "ModelConfig":
-        """Base config matching scGPT paper (12 layers, 512 dim, ~53M params)."""
+        """Base config matching scGPT paper (12 layers, 512 dim, ~100M params).
+
+        Note: This uses 8 heads and 4× FF expansion (standard transformer).
+        For the actual scGPT architecture (51M params), use scgpt_matched() instead.
+        """
         return cls(
             n_layers=12,
             n_heads=8,
             d_model=512,
             n_expression_bins=51,  # scGPT paper default
             dropout=0.1,
+        )
+
+    @classmethod
+    def scgpt_matched(cls) -> "ModelConfig":
+        """Config matching actual scGPT implementation (51M params).
+
+        Verified from scGPT source code (Tutorial_Annotation.ipynb):
+        - 12 layers, 4 heads (not 8!), 512 dim
+        - 1× FF expansion (d_hid = d_model = 512, not 4×)
+        - Weight tying between embedding and gene_head
+        - ~51M parameters (2× smaller than base config)
+
+        This is the efficient baseline used in the original scGPT paper.
+        """
+        return cls(
+            n_layers=12,
+            n_heads=4,  # Actual scGPT uses 4, not 8
+            d_model=512,
+            d_ff=512,  # 1× expansion, not 4×!
+            n_expression_bins=51,
+            dropout=0.2,  # scGPT uses 0.2
+            bias=False,
+            tie_weights=True,  # Share embedding and gene_head weights
         )
 
     @classmethod

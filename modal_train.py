@@ -73,6 +73,10 @@ def train_on_modal(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    use_swiglu: bool = False,
+    use_lp_layernorm: bool = False,
+    use_softcap: bool = False,
+    use_strict_bf16: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
@@ -84,11 +88,19 @@ def train_on_modal(
         n_steps: Number of training steps
         learning_rate: Learning rate
         log_every: Log interval
-        model_size: Model size preset (small/base/large)
+        model_size: Model size preset (small/scgpt/base/large)
+            - small: 4L, 4H, 256D (dev/testing)
+            - scgpt: 12L, 4H, 512D, 1×FF (~51M params, matches original scGPT)
+            - base: 12L, 8H, 512D, 4×FF (~102M params, standard transformer)
+            - large: 24L, 16H, 1024D, 4×FF (scaling experiments)
         gradient_accumulation_steps: Accumulate gradients over N micro-batches
             Effective batch = batch_size * gradient_accumulation_steps
         use_gradient_checkpointing: Trade compute for ~50% activation memory savings
         use_compile: Use torch.compile for fused kernels (may speed up training)
+        use_swiglu: Use SwiGLU activation (Llama-style) instead of GELU
+        use_lp_layernorm: Force LayerNorm to stay in bf16 (Tahoe-X1 optimization)
+        use_softcap: Apply logit softcapping to prevent extreme logits (nanochat)
+        use_strict_bf16: Convert entire model to bf16 (more aggressive than autocast)
         profile: Log timing breakdown (data/mask/forward/backward/optim)
         data_source: Data source - "s3", "volume", or "hf" (HuggingFace)
 
@@ -165,6 +177,8 @@ def train_on_modal(
     # Get model config
     if model_size == "small":
         config = ModelConfig.small()
+    elif model_size == "scgpt":
+        config = ModelConfig.scgpt_matched()
     elif model_size == "base":
         config = ModelConfig.base()
     elif model_size == "large":
@@ -172,6 +186,19 @@ def train_on_modal(
     else:
         logger.error(f"Unknown model size: {model_size}")
         return {"error": f"Unknown model size: {model_size}"}
+
+    # Apply optimizations if requested
+    if use_swiglu:
+        config.use_swiglu = True
+        logger.info("Using SwiGLU activation (Llama-style)")
+
+    if use_lp_layernorm:
+        config.use_lp_layernorm = True
+        logger.info("Using low-precision LayerNorm (Tahoe-X1 style)")
+
+    if use_softcap:
+        config.use_softcap = True
+        logger.info("Using logit softcapping (nanochat optimization)")
 
     logger.info(f"Model size: {model_size}")
     logger.info(f"Batch size: {batch_size}")
@@ -253,6 +280,10 @@ def main(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    use_swiglu: bool = False,
+    use_lp_layernorm: bool = False,
+    use_softcap: bool = False,
+    use_strict_bf16: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> None:
@@ -264,10 +295,13 @@ def main(
         n_steps: Training steps (default: 500)
         learning_rate: LR (default: 1e-4)
         log_every: Log interval (default: 1)
-        model_size: small/base/large (default: small)
+        model_size: small/scgpt/base/large (default: small)
         gradient_accumulation_steps: Effective batch = batch_size * this
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
+        use_swiglu: Use SwiGLU activation instead of GELU
+        use_lp_layernorm: Force LayerNorm to stay in bf16
+        use_softcap: Apply logit softcapping (nanochat)
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
     """
@@ -279,6 +313,9 @@ def main(
     print(f"  effective_batch_size={effective_batch}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
+    print(f"  use_swiglu={use_swiglu}")
+    print(f"  use_lp_layernorm={use_lp_layernorm}")
+    print(f"  use_softcap={use_softcap}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print()
@@ -293,6 +330,9 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        use_swiglu=use_swiglu,
+        use_lp_layernorm=use_lp_layernorm,
+        use_softcap=use_softcap,
         profile=profile,
         data_source=data_source,
     )

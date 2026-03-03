@@ -11,9 +11,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from loguru import logger
 from torch.utils.checkpoint import checkpoint
 
 from fast_scgpt.config import ModelConfig
+from fast_scgpt.lp_layernorm import LPLayerNorm
+
+
+class TiedLinear(nn.Module):
+    """Linear layer that shares weights with an embedding layer.
+
+    Used for weight tying between input embedding and output projection.
+    Only uses the first `vocab_size` entries of the embedding.
+    """
+
+    def __init__(self, embedding: nn.Embedding, vocab_size: int):
+        super().__init__()
+        self.embedding = embedding
+        self.vocab_size = vocab_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply tied linear transformation.
+
+        Args:
+            x: Input of shape (batch, seq_len, d_model)
+
+        Returns:
+            Output of shape (batch, seq_len, vocab_size)
+        """
+        # Use embedding weights as linear layer weights
+        # embedding.weight: (total_vocab_size, d_model)
+        # We only use [:vocab_size] for gene prediction
+        # Linear: y = x @ W.T, where W is (vocab_size, d_model)
+        weight = self.embedding.weight[: self.vocab_size]  # (vocab_size, d_model)
+        return F.linear(x, weight)  # (batch, seq_len, vocab_size)
 
 
 class TokenEmbedding(nn.Module):
@@ -125,13 +156,22 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     """Position-wise feed-forward network.
 
-    Uses GELU activation. ReLU² was tested but causes regression with
-    Flash Attention due to unfused intermediate tensors.
+    Supports both GELU (default) and SwiGLU (Llama-style) activations.
+    SwiGLU: SwiGLU(x, W, V) = Swish(xW) ⊗ xV
     """
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(config.d_model, config.ff_dim, bias=config.bias)
+        self.use_swiglu = config.use_swiglu
+
+        if self.use_swiglu:
+            # SwiGLU requires 2 up-projections (gate + value)
+            self.gate_proj = nn.Linear(config.d_model, config.ff_dim, bias=config.bias)
+            self.up_proj = nn.Linear(config.d_model, config.ff_dim, bias=config.bias)
+        else:
+            # Standard GELU
+            self.fc1 = nn.Linear(config.d_model, config.ff_dim, bias=config.bias)
+
         self.fc2 = nn.Linear(config.ff_dim, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -144,8 +184,15 @@ class FeedForward(nn.Module):
         Returns:
             Output of shape (batch, seq_len, d_model)
         """
-        x = self.fc1(x)
-        x = F.gelu(x)
+        if self.use_swiglu:
+            # SwiGLU: Swish(xW) ⊗ xV
+            gate = F.silu(self.gate_proj(x))  # silu = swish
+            x = gate * self.up_proj(x)
+        else:
+            # Standard GELU
+            x = self.fc1(x)
+            x = F.gelu(x)
+
         x = self.dropout(x)
         x = self.fc2(x)
         return x
@@ -161,8 +208,12 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = MultiHeadAttention(config)
         self.ff = FeedForward(config)
-        self.norm1 = nn.LayerNorm(config.d_model)
-        self.norm2 = nn.LayerNorm(config.d_model)
+
+        # Choose LayerNorm implementation
+        norm_class = LPLayerNorm if config.use_lp_layernorm else nn.LayerNorm
+        self.norm1 = norm_class(config.d_model)
+        self.norm2 = norm_class(config.d_model)
+
         self.dropout = nn.Dropout(config.dropout)
         self.use_checkpoint = use_checkpoint
 
@@ -236,11 +287,14 @@ class ScGPT(nn.Module):
         )
 
         # Final layer norm
-        self.norm_f = nn.LayerNorm(config.d_model)
+        norm_class = LPLayerNorm if config.use_lp_layernorm else nn.LayerNorm
+        self.norm_f = norm_class(config.d_model)
 
         # Output heads
-        # Gene prediction: predict masked gene tokens
-        self.gene_head = nn.Linear(config.d_model, config.vocab_size, bias=config.bias)
+        # Gene prediction: predict masked gene tokens (may be replaced by TiedLinear if tie_weights)
+        self.gene_head: nn.Linear | TiedLinear = nn.Linear(
+            config.d_model, config.vocab_size, bias=config.bias
+        )
         # Expression prediction: predict expression bin
         self.expr_head = nn.Linear(
             config.d_model, config.n_expression_bins, bias=config.bias
@@ -248,6 +302,16 @@ class ScGPT(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Weight tying: Share embedding and gene_head weights
+        if config.tie_weights:
+            # Replace gene_head with a wrapper that uses embedding weights
+            # This avoids creating a separate weight matrix
+            self.gene_head = TiedLinear(self.embedding.embedding, config.vocab_size)
+            logger.info(
+                f"Weight tying enabled: gene_head shares weights with embedding "
+                f"(saves {config.vocab_size * config.d_model / 1e6:.1f}M params)"
+            )
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights with small values for stable training."""
@@ -295,6 +359,11 @@ class ScGPT(nn.Module):
         # Output heads
         gene_logits = self.gene_head(x)
         expr_logits = self.expr_head(x)
+
+        # Apply logit softcapping if enabled (nanochat optimization)
+        if self.config.use_softcap:
+            gene_logits = 15.0 * torch.tanh(gene_logits / 15.0)
+            expr_logits = 15.0 * torch.tanh(expr_logits / 15.0)
 
         return {
             "gene_logits": gene_logits,
