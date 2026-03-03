@@ -1,9 +1,11 @@
 """Modal distributed training script for fast-scGPT on 8x H100.
 
-This script deploys distributed training to Modal's multi-GPU infrastructure.
+Uses queue-based distributed dataloader from slaf (PR #24 distributed_dataloader).
+Requires the slaf app to be deployed first: from slaf repo, distributed_dataloader branch:
+  modal deploy slaf/ml/distributed.py
 
 Usage:
-    # Run with defaults (8x H100, 500 steps)
+    # Run with defaults (2x H100 for testing, 500 steps)
     modal run modal_train_distributed.py
 
     # Custom configuration
@@ -18,6 +20,9 @@ Usage:
 Results are saved to /data/benchmark_results/ on the volume.
 """
 
+import os
+import uuid
+
 import modal
 
 # Create Modal app
@@ -26,11 +31,11 @@ app = modal.App("fast-scgpt-distributed")
 # Mount existing Modal volume with SLAF datasets
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
-# Build image with CUDA + dependencies + Accelerate
+# Build image with CUDA + dependencies; slaf from distributed_dataloader for queue-based dataloader
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
-    .pip_install(
+    .uv_pip_install(
         "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
         "einops>=0.7",
         "numpy>=1.24",
@@ -41,11 +46,15 @@ image = (
         "s3fs>=2024.2",
         "packaging",
         "ninja",
-        "slafdb",
-        "accelerate>=0.27",  # HuggingFace Accelerate for distributed
+        "modal",
+        "accelerate>=0.27",
+    )
+    # slaf with distributed dataloader (queue-based, multi-consumer)
+    .uv_pip_install(
+        "git+https://github.com/slaf-project/slaf.git@distributed_dataloader",
     )
     # Flash Attention - FA3 on H100
-    .pip_install(
+    .uv_pip_install(
         "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
     )
     # Copy local fast_scgpt package
@@ -55,7 +64,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="H100:2",  # Start with 2x H100 to debug
+    gpu="H100:8",
     timeout=14400,  # 4 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -89,7 +98,6 @@ def train_distributed_on_modal(
     Returns:
         dict with training summary metrics
     """
-    import os
     import subprocess
     import sys
 
@@ -151,6 +159,17 @@ def train_distributed_on_modal(
     # Longer timeout - S3 data loading can be slow
     os.environ["NCCL_TIMEOUT"] = "300"
 
+    # Queue name for distributed dataloader (all ranks attach to same queue)
+    run_id = os.environ.get("MODAL_REQUEST_ID", str(uuid.uuid4())[:8])
+    queue_name = f"fast-scgpt-ddp-{run_id}"
+    os.environ["SLAF_QUEUE_NAME"] = queue_name
+    logger.info(f"SLAF_QUEUE_NAME={queue_name}")
+
+    # Create the queue on the server so it exists before torchrun children (and slaf workers) attach.
+    # from_name(create_if_missing=True) is lazy and only creates on first put/get; objects.create() actually creates.
+    modal.Queue.objects.create(queue_name, allow_existing=True, environment_name="main")
+    logger.info("Queue created in workspace (main)")
+
     # Build torchrun command for native DDP
     num_gpus = torch.cuda.device_count()
     cmd = [
@@ -177,8 +196,9 @@ def train_distributed_on_modal(
 
     if use_gradient_checkpointing:
         cmd.append("--use_gradient_checkpointing")
-    # Note: use_compile and profile not yet implemented in train_ddp.py
-    _ = use_compile, profile  # Silence unused warnings
+    if profile:
+        cmd.append("--profile")
+    _ = use_compile  # Not yet implemented in train_ddp.py
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")

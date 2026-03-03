@@ -1,8 +1,9 @@
 """Distributed training for Fast-scGPT using native PyTorch DDP.
 
-Simpler than Accelerate - direct control over distributed operations.
+Uses queue-based distributed dataloader (slaf DistributedSLAFDataLoader + DistributedDataLoader).
+Each rank reads batches from the same Modal Queue; no batch broadcast.
 
-Usage:
+Usage (Modal sets SLAF_QUEUE_NAME before torchrun):
     torchrun --nproc_per_node=8 -m fast_scgpt.train_ddp --slaf_path s3://...
 """
 
@@ -11,6 +12,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+import modal
 import torch
 import torch.distributed as dist
 from loguru import logger
@@ -19,6 +21,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.model import ScGPT
 from fast_scgpt.train import clip_expression_tokens, create_mask
+
+# Indices for timing gather (dl, mask, fwd, bwd, opt, compute_total, total_ms)
+_IDX_DL, _IDX_MASK, _IDX_FWD, _IDX_BWD, _IDX_OPT, _IDX_COMPUTE, _IDX_TOTAL = range(7)
 
 
 @dataclass
@@ -76,34 +81,54 @@ def cleanup_distributed() -> None:
     dist.destroy_process_group()
 
 
-def broadcast_batch(
-    batch_cpu: dict[str, torch.Tensor] | None,
+def _log_timing_all_ranks(
+    _rank: int,
+    is_main: bool,
+    world_size: int,
+    log_every: int,
     device: torch.device,
-    rank: int,
-) -> dict[str, torch.Tensor]:
-    """Broadcast batch from rank 0 to all ranks."""
-    # First broadcast the shape
-    if rank == 0:
-        assert batch_cpu is not None
-        shape = torch.tensor(batch_cpu["input_ids"].shape, device=device)
-    else:
-        shape = torch.zeros(2, dtype=torch.long, device=device)
-
-    dist.broadcast(shape, src=0)
-    batch_shape = tuple(shape.tolist())
-
-    # Now broadcast the actual tensors
-    if rank == 0:
-        input_ids = batch_cpu["input_ids"].to(device)  # type: ignore
-        attention_mask = batch_cpu["attention_mask"].to(device)  # type: ignore
-    else:
-        input_ids = torch.zeros(batch_shape, dtype=torch.long, device=device)
-        attention_mask = torch.zeros(batch_shape, dtype=torch.long, device=device)
-
-    dist.broadcast(input_ids, src=0)
-    dist.broadcast(attention_mask, src=0)
-
-    return {"input_ids": input_ids, "attention_mask": attention_mask}
+    accum_dl_ms: float,
+    accum_mask_ms: float,
+    accum_forward_ms: float,
+    accum_backward_ms: float,
+    accum_optim_ms: float,
+) -> None:
+    """Gather per-rank timings and log min/max/mean on rank 0."""
+    compute_total = (
+        accum_mask_ms + accum_forward_ms + accum_backward_ms + accum_optim_ms
+    )
+    total_ms = accum_dl_ms + compute_total
+    local_timing = torch.tensor(
+        [
+            accum_dl_ms,
+            accum_mask_ms,
+            accum_forward_ms,
+            accum_backward_ms,
+            accum_optim_ms,
+            compute_total,
+            total_ms,
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    tensor_list = [
+        torch.zeros(7, dtype=torch.float32, device=device) for _ in range(world_size)
+    ]
+    dist.all_gather(tensor_list, local_timing)
+    stacked = torch.stack(tensor_list)  # (world_size, 7)
+    mins = stacked.min(dim=0).values.cpu()
+    maxs = stacked.max(dim=0).values.cpu()
+    means = stacked.float().mean(dim=0).cpu()
+    if is_main:
+        logger.info(
+            f"  Timing (all {world_size} ranks, last {log_every} step(s)): "
+            f"dl min={mins[_IDX_DL]:.0f} max={maxs[_IDX_DL]:.0f} avg={means[_IDX_DL]:.0f}ms | "
+            f"mask min={mins[_IDX_MASK]:.0f} max={maxs[_IDX_MASK]:.0f} avg={means[_IDX_MASK]:.0f}ms | "
+            f"fwd min={mins[_IDX_FWD]:.0f} max={maxs[_IDX_FWD]:.0f} avg={means[_IDX_FWD]:.0f}ms | "
+            f"bwd min={mins[_IDX_BWD]:.0f} max={maxs[_IDX_BWD]:.0f} avg={means[_IDX_BWD]:.0f}ms | "
+            f"opt min={mins[_IDX_OPT]:.0f} max={maxs[_IDX_OPT]:.0f} avg={means[_IDX_OPT]:.0f}ms | "
+            f"total min={mins[_IDX_TOTAL]:.0f} max={maxs[_IDX_TOTAL]:.0f} avg={means[_IDX_TOTAL]:.0f}ms"
+        )
 
 
 def train_ddp(
@@ -115,6 +140,7 @@ def train_ddp(
     learning_rate: float = 1e-4,
     log_every: int = 1,
     use_gradient_checkpointing: bool = False,
+    profile: bool = False,
 ) -> DistributedMetrics:
     """Train with native PyTorch DDP."""
     # Setup distributed
@@ -137,28 +163,60 @@ def train_ddp(
 
         check_flash_attn()
 
-    # Only rank 0 loads data
-    slaf_array = None
-    dataloader = None
+    # Queue-based distributed dataloader: SLAF_QUEUE_NAME must be set by orchestrator (e.g. Modal)
+    queue_name = os.environ.get("SLAF_QUEUE_NAME")
+    if not queue_name:
+        raise RuntimeError(
+            "SLAF_QUEUE_NAME not set. Use queue-based DDP from Modal (modal run modal_train_distributed.py)."
+        )
 
+    # Rank 0: load SLAF metadata and spawn producer workers (DistributedSLAFDataLoader)
     if is_main:
         try:
             from slaf import SLAFArray
-            from slaf.ml import SLAFDataLoader
+            from slaf.ml.distributed import DistributedSLAFDataLoader
         except ImportError as e:
-            raise ImportError("slafdb required") from e
+            raise ImportError(
+                "slaf with distributed dataloader required (pip install git+https://github.com/slaf-project/slaf.git@distributed_dataloader)"
+            ) from e
 
         logger.info(f"Loading SLAF from: {slaf_path}")
         t0 = time.time()
         slaf_array = SLAFArray(slaf_path)
         logger.info(f"SLAFArray loaded in {time.time() - t0:.2f}s")
 
-    # Broadcast vocab info
-    if is_main:
-        num_genes = slaf_array.shape[1]  # type: ignore
+        num_genes = slaf_array.shape[1]
+        vocab_size = 4 + num_genes
+        # Spawn producers and create queue; do not iterate over this loader
+        _producer_loader = DistributedSLAFDataLoader(
+            slaf_array=slaf_array,
+            tokenizer_type="scgpt",
+            batch_size=batch_size,
+            max_genes=max_genes,
+            vocab_size=vocab_size,
+            n_expression_bins=config.n_expression_bins,
+            queue_name=queue_name,
+            n_workers=8,
+            n_scanners=8,
+            prefetch_batch_size=16_384,
+            prefetch_batch_count=16,
+            return_tensors=True,
+            queue_timeout=30.0,
+            seed=42,
+        )
+        logger.info(f"DistributedSLAFDataLoader spawned producers, queue={queue_name}")
+        # Wait until producers have filled the queue so consumers don't hit empty timeouts
+        size = _producer_loader.wait_for_queue(min_batches=50, timeout_seconds=300)
+        logger.info(f"Queue has {size} batches, starting consumption")
+        # Keep reference so producers stay alive; we consume via DistributedDataLoader below
+        _producer_loader_ref = _producer_loader
+
         vocab_tensor = torch.tensor([num_genes], device=device)
     else:
         vocab_tensor = torch.zeros(1, dtype=torch.long, device=device)
+
+    # Sync so non-main ranks don't attach to the queue before it's ready
+    dist.barrier()
 
     dist.broadcast(vocab_tensor, src=0)
     num_genes = int(vocab_tensor[0].item())
@@ -184,25 +242,21 @@ def train_ddp(
         model.parameters(), lr=learning_rate, weight_decay=0.1, betas=(0.9, 0.95)
     )
 
-    # Create dataloader on rank 0
-    if is_main:
-        from slaf.ml import SLAFDataLoader
+    # All ranks: attach to same queue and create consumer dataloader
+    from slaf.distributed.dataloader import DistributedDataLoader
 
-        dataloader = SLAFDataLoader(
-            slaf_array=slaf_array,  # type: ignore
-            tokenizer_type="scgpt",
-            batch_size=batch_size,
-            max_genes=max_genes,
-            n_expression_bins=config.n_expression_bins,
-            vocab_size=vocab_size,
-            use_mixture_of_scanners=True,
-            prefetch_batch_size=512000,
-            verbose=False,
-        )
-        logger.info("SLAFDataLoader created")
-        dataloader_iter = iter(dataloader)
+    queue = modal.Queue.from_name(
+        queue_name, create_if_missing=False, environment_name="main"
+    )
+    dataloader = DistributedDataLoader(
+        queue,
+        batch_size=batch_size,
+        return_tensors=True,
+        prefetch_factor=2,
+        queue_timeout=30.0,
+    )
+    dataloader_iter = iter(dataloader)
 
-    # Sync before training
     dist.barrier()
 
     metrics = DistributedMetrics(world_size=world_size)
@@ -219,35 +273,36 @@ def train_ddp(
     start_time = time.time()
     first_loss = None
     last_loss = None
+    # Timing accumulators for profile (dl=queue+transfer, mask, forward, backward, optim)
+    accum_dl_ms = 0.0
+    accum_mask_ms = 0.0
+    accum_forward_ms = 0.0
+    accum_backward_ms = 0.0
+    accum_optim_ms = 0.0
 
     while step < n_steps:
-        # Signal tensor for coordinating termination
-        continue_signal = torch.ones(1, dtype=torch.long, device=device)
-
-        # Rank 0 loads batch
-        batch_cpu = None
-        if is_main:
-            logger.debug(f"Step {step}: Loading batch...")
-            load_start = time.perf_counter()
-            try:
-                batch_cpu = next(dataloader_iter)  # type: ignore
-                logger.debug(
-                    f"Step {step}: Batch loaded in {time.perf_counter() - load_start:.2f}s"
-                )
-            except StopIteration:
-                logger.warning(f"Dataloader exhausted at step {step}")
-                continue_signal[0] = 0
-
-        # Broadcast continue signal (acts as sync point)
-        dist.broadcast(continue_signal, src=0)
-        if continue_signal[0].item() == 0:
+        t_dl_start = time.perf_counter()
+        try:
+            batch_cpu = next(dataloader_iter)
+        except StopIteration:
+            logger.info(f"[Rank {rank}] Queue exhausted (StopIteration), exiting loop")
             break
+        except Exception as e:
+            logger.exception(
+                f"[Rank {rank}] Error reading from queue (step={step}): {type(e).__name__} {e}"
+            )
+            raise
 
-        # Broadcast batch
-        batch = broadcast_batch(batch_cpu, device, rank)
+        # Move batch to device (each rank has its own batch from the queue)
+        input_ids = batch_cpu["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch_cpu["attention_mask"].to(device, non_blocking=True)
+        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-        # Timing
-        torch.cuda.synchronize(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_dl_end = time.perf_counter()
+        dl_ms = (t_dl_end - t_dl_start) * 1000
+
         step_start = time.perf_counter()
 
         # Forward pass
@@ -259,6 +314,10 @@ def train_ddp(
             input_ids, config.vocab_size, config.n_expression_bins
         )
 
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_after_clip = time.perf_counter()
+
         masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
             input_ids,
             attention_mask,
@@ -268,6 +327,10 @@ def train_ddp(
             expr_token_offset=config.expr_token_offset,
             mask_ratio=0.15,
         )
+
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_mask = time.perf_counter()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(masked_input_ids, attention_mask)
@@ -285,13 +348,35 @@ def train_ddp(
             )
             loss = gene_loss + expr_loss
 
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_forward = time.perf_counter()
+
         # Backward
         optimizer.zero_grad()
         loss.backward()
+
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_backward = time.perf_counter()
+
         optimizer.step()
 
-        torch.cuda.synchronize(device)
-        step_time_ms = (time.perf_counter() - step_start) * 1000
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_optim = time.perf_counter()
+        step_time_ms = (t_optim - step_start) * 1000
+
+        if profile:
+            mask_ms = (t_mask - t_after_clip) * 1000
+            forward_ms = (t_forward - t_mask) * 1000
+            backward_ms = (t_backward - t_forward) * 1000
+            optim_ms = (t_optim - t_backward) * 1000
+            accum_dl_ms += dl_ms
+            accum_mask_ms += mask_ms
+            accum_forward_ms += forward_ms
+            accum_backward_ms += backward_ms
+            accum_optim_ms += optim_ms
 
         metrics.update(step_time_ms, batch_size, device)
         loss_val = loss.item()
@@ -301,9 +386,6 @@ def train_ddp(
             first_loss = loss_val
 
         step += 1
-
-        # All ranks log completion (for debugging distributed hangs)
-        logger.debug(f"[Rank {rank}] Step {step} complete, going to load next batch")
 
         if is_main and step % log_every == 0:
             avg_loss = total_loss / log_every
@@ -315,23 +397,48 @@ def train_ddp(
             )
             total_loss = 0.0
 
+        if step % log_every == 0 and profile and accum_forward_ms > 0:
+            _log_timing_all_ranks(
+                rank,
+                is_main,
+                world_size,
+                log_every,
+                device,
+                accum_dl_ms,
+                accum_mask_ms,
+                accum_forward_ms,
+                accum_backward_ms,
+                accum_optim_ms,
+            )
+            accum_dl_ms = accum_mask_ms = accum_forward_ms = accum_backward_ms = (
+                accum_optim_ms
+            ) = 0.0
+
     # Summary
     elapsed = time.time() - start_time
     summary = metrics.summary()
 
     if is_main:
+        # Release producer loader before barrier/cleanup so its teardown (threads, Modal)
+        # runs while process group is still alive; avoids SIGABRT on process exit.
+        _producer_loader_ref = None
         total_cells = summary["total_cells"] * world_size
         training_time = sum(metrics._step_times) / 1000
         logger.info("─" * 60)
         logger.info(f"Training complete: {step} steps in {elapsed:.1f}s")
         logger.info(f"  World size: {world_size} GPUs")
         logger.info(f"  Median step time: {summary['median_step_time_ms']:.0f}ms")
-        logger.info(f"  Throughput: {total_cells / training_time:.0f} cells/sec")
+        if training_time > 0:
+            logger.info(f"  Throughput: {total_cells / training_time:.0f} cells/sec")
+        else:
+            logger.info("  Throughput: N/A (no steps)")
         logger.info(f"  Peak memory: {summary['peak_memory_gb']:.1f}GB")
         if first_loss and last_loss:
             logger.info(f"  Loss: {first_loss:.4f} → {last_loss:.4f}")
         logger.info("─" * 60)
 
+    # Sync all ranks before cleanup (whether we hit n_steps or StopIteration)
+    dist.barrier()
     cleanup_distributed()
     return metrics
 
@@ -348,6 +455,11 @@ def main() -> None:
         "--model_size", type=str, default="small", choices=["small", "base", "large"]
     )
     parser.add_argument("--use_gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Log timing breakdown (dl=queue+transfer, mask, forward, backward, optim)",
+    )
     args = parser.parse_args()
 
     if args.model_size == "small":
@@ -366,6 +478,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         log_every=args.log_every,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
+        profile=args.profile,
     )
 
 
