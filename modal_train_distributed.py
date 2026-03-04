@@ -205,6 +205,7 @@ def train_distributed_on_modal(
 
     # Run distributed training
     start_time = __import__("time").time()
+    summary = None
 
     try:
         subprocess.run(
@@ -213,40 +214,62 @@ def train_distributed_on_modal(
             capture_output=False,  # Stream output directly
             check=True,
         )
+        elapsed = __import__("time").time() - start_time
+        effective_batch = batch_size * num_gpus
+        summary = {
+            "status": "success",
+            "n_steps": n_steps,
+            "batch_size_per_gpu": batch_size,
+            "effective_batch_size": effective_batch,
+            "num_gpus": num_gpus,
+            "max_genes": max_genes,
+            "model_size": model_size,
+            "elapsed_sec": elapsed,
+            "gpu_name": torch.cuda.get_device_name(0),
+        }
     except subprocess.CalledProcessError as e:
         logger.error(f"Training failed with exit code {e.returncode}")
-        return {"error": f"Training failed: {e}"}
+        summary = {"error": f"Training failed: {e}"}
+    finally:
+        # Remove run-specific queue and dict so they don't accumulate in the workspace
+        import asyncio
 
-    elapsed = __import__("time").time() - start_time
+        async def _cleanup() -> None:
+            try:
+                await modal.Queue.objects.delete(
+                    queue_name, allow_missing=True, environment_name="main"
+                )
+                logger.info(f"Cleaned up queue: {queue_name}")
+            except Exception as e:
+                logger.warning(f"Cleanup queue failed (non-fatal): {e}")
+            dict_name = f"{queue_name}-partial-groups"
+            try:
+                await modal.Dict.objects.delete(
+                    dict_name, allow_missing=True, environment_name="main"
+                )
+                logger.info(f"Cleaned up dict: {dict_name}")
+            except Exception as e:
+                logger.warning(f"Cleanup dict failed (non-fatal): {e}")
 
-    # Build results
-    effective_batch = batch_size * num_gpus
-    summary = {
-        "status": "success",
-        "n_steps": n_steps,
-        "batch_size_per_gpu": batch_size,
-        "effective_batch_size": effective_batch,
-        "num_gpus": num_gpus,
-        "max_genes": max_genes,
-        "model_size": model_size,
-        "elapsed_sec": elapsed,
-        "gpu_name": torch.cuda.get_device_name(0),
-    }
+        try:
+            asyncio.run(_cleanup())
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup queue/dict failed (non-fatal): {cleanup_err}")
 
-    # Save results to volume
-    import json
-    from datetime import datetime
+    if summary is None:
+        summary = {"error": "Training did not produce a summary"}
 
-    results_dir = "/data/benchmark_results"
-    os.makedirs(results_dir, exist_ok=True)
+    if summary.get("status") == "success":
+        import json
+        from datetime import datetime
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = f"{results_dir}/distributed_{timestamp}.json"
-
-    with open(results_file, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    logger.info(f"Results saved to: {results_file}")
+        results_dir = "/data/benchmark_results"
+        os.makedirs(results_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = f"{results_dir}/distributed_{timestamp}.json"
+        with open(results_file, "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"Results saved to: {results_file}")
 
     return summary
 
