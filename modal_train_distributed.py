@@ -5,8 +5,11 @@ Requires the slaf app to be deployed first: from slaf repo, distributed_dataload
   modal deploy slaf/ml/distributed.py
 
 Usage:
-    # Run with defaults (2x H100 for testing, 500 steps)
+    # Single node (8x H100)
     modal run modal_train_distributed.py
+
+    # Multi-node (2 nodes = 16x H100, default for --multinode)
+    modal run modal_train_distributed.py --multinode
 
     # Custom configuration
     modal run modal_train_distributed.py --batch-size 64 --n-steps 1000
@@ -20,10 +23,14 @@ Usage:
 Results are saved to /data/benchmark_results/ on the volume.
 """
 
+from __future__ import annotations
+
 import os
 import uuid
+from typing import Any
 
 import modal
+import modal.experimental
 
 # Create Modal app
 app = modal.App("fast-scgpt-distributed")
@@ -32,9 +39,16 @@ app = modal.App("fast-scgpt-distributed")
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
 # Build image with CUDA + dependencies; slaf from distributed_dataloader for queue-based dataloader
+# libhwloc15, libnl-route-3-200 (and ibverbs) needed for efa_enabled on multi-node
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
+    .apt_install(
+        "git",
+        "libibverbs-dev",
+        "libibverbs1",
+        "libhwloc15",
+        "libnl-route-3-200",
+    )
     .uv_pip_install(
         "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
         "einops>=0.7",
@@ -62,56 +76,58 @@ image = (
 )
 
 
-@app.function(
-    image=image,
-    gpu="H100:8",
-    timeout=14400,  # 4 hours max
-    volumes={"/data": slaf_volume},
-    secrets=[modal.Secret.from_name("s3-credentials")],
-)
-def train_distributed_on_modal(
-    batch_size: int = 64,
-    max_genes: int = 1024,
-    n_steps: int = 500,
-    learning_rate: float = 1e-4,
-    log_every: int = 1,
-    model_size: str = "base",
-    use_gradient_checkpointing: bool = False,
-    use_compile: bool = False,
-    profile: bool = False,
-    data_source: str = "s3",
+def _run_training(
+    *,
+    batch_size: int,
+    max_genes: int,
+    n_steps: int,
+    learning_rate: float,
+    log_every: int,
+    model_size: str,
+    use_gradient_checkpointing: bool,
+    use_compile: bool,
+    profile: bool,
+    data_source: str,
+    cluster_info: Any = None,
 ) -> dict:
-    """Run distributed training on 8x H100 Modal.
+    """Shared training entrypoint for single-node and multi-node.
 
-    Args:
-        batch_size: Batch size per GPU (total = batch_size * 8)
-        max_genes: Maximum genes per cell (affects seq_len)
-        n_steps: Number of training steps
-        learning_rate: Learning rate
-        log_every: Log interval
-        model_size: Model size preset (small/base/large)
-        use_gradient_checkpointing: Trade compute for ~50% activation memory savings
-        use_compile: Use torch.compile for fused kernels
-        profile: Log timing breakdown (data/mask/forward/backward/optim)
-        data_source: Data source - "s3", "volume", or "hf"
-
-    Returns:
-        dict with training summary metrics
+    When cluster_info is None, runs single-node (this container only).
+    When cluster_info is set (from modal.experimental.get_cluster_info()), runs
+    as one node in a multi-node job; torchrun args include nnodes/node_rank/master_addr.
     """
     import subprocess
     import sys
+    import time
 
     sys.path.insert(0, "/root")
 
     import torch
     from loguru import logger
 
+    is_multinode = cluster_info is not None
+    if is_multinode:
+        num_nodes = len(cluster_info.container_ips)
+        node_rank = cluster_info.rank
+        master_addr = cluster_info.container_ips[0]
+        num_gpus_total = 8 * num_nodes
+        logger.info(
+            f"Multi-node: node_rank={node_rank} nnodes={num_nodes} master_addr={master_addr}"
+        )
+    else:
+        num_nodes = 1
+        node_rank = 0
+        num_gpus_total = torch.cuda.device_count()
+
     # Log GPU info
     logger.info("=" * 60)
-    logger.info("Modal Distributed Training - fast-scGPT")
+    logger.info(
+        "Modal Distributed Training - fast-scGPT"
+        + (" (multi-node)" if is_multinode else "")
+    )
     logger.info("=" * 60)
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
-    logger.info(f"GPU count: {torch.cuda.device_count()}")
+    logger.info(f"GPU count (this node): {torch.cuda.device_count()}")
 
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -137,8 +153,8 @@ def train_distributed_on_modal(
     logger.info(f"Data source: {data_source}")
     logger.info(f"SLAF path: {slaf_path}")
 
-    # Verify S3 connectivity
-    if slaf_path.startswith("s3://"):
+    # Verify S3 connectivity (once per node is enough; rank 0 only to avoid log spam)
+    if slaf_path.startswith("s3://") and (not is_multinode or node_rank == 0):
         logger.info("Verifying S3 connectivity...")
         try:
             import s3fs
@@ -155,27 +171,34 @@ def train_distributed_on_modal(
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # NCCL debugging
-    os.environ["NCCL_DEBUG"] = "WARN"  # Less verbose
-    # Longer timeout - S3 data loading can be slow
+    os.environ["NCCL_DEBUG"] = "WARN"
     os.environ["NCCL_TIMEOUT"] = "300"
 
-    # Queue name for distributed dataloader (all ranks attach to same queue)
-    run_id = os.environ.get("MODAL_REQUEST_ID", str(uuid.uuid4())[:8])
+    # Queue name for distributed dataloader (all ranks on all nodes attach to same queue).
+    # In multi-node, all containers must use the SAME queue name; use cluster_id so node 0 and node 1 agree.
+    if is_multinode:
+        run_id = cluster_info.cluster_id
+    else:
+        run_id = os.environ.get("MODAL_REQUEST_ID", str(uuid.uuid4())[:8])
     queue_name = f"fast-scgpt-ddp-{run_id}"
+    dict_name = f"{queue_name}-partial-groups"
     os.environ["SLAF_QUEUE_NAME"] = queue_name
-    logger.info(f"SLAF_QUEUE_NAME={queue_name}")
+    os.environ["SLAF_PARTIAL_GROUPS_DICT"] = (
+        dict_name  # same convention as queue so all nodes share one dict
+    )
+    logger.info(
+        f"SLAF_QUEUE_NAME={queue_name}"
+        + (f" (cluster_id, node_rank={node_rank})" if is_multinode else "")
+    )
 
-    # Create the queue on the server so it exists before torchrun children (and slaf workers) attach.
-    # from_name(create_if_missing=True) is lazy and only creates on first put/get; objects.create() actually creates.
     modal.Queue.objects.create(queue_name, allow_existing=True, environment_name="main")
     logger.info("Queue created in workspace (main)")
 
-    # Build torchrun command for native DDP
-    num_gpus = torch.cuda.device_count()
+    num_gpus_per_node = torch.cuda.device_count()
     cmd = [
         "torchrun",
         "--nproc_per_node",
-        str(num_gpus),
+        str(num_gpus_per_node),
         "-m",
         "fast_scgpt.train_ddp",
         "--slaf_path",
@@ -193,35 +216,59 @@ def train_distributed_on_modal(
         "--model_size",
         model_size,
     ]
-
+    if is_multinode:
+        cmd = [
+            "torchrun",
+            f"--nnodes={num_nodes}",
+            f"--node_rank={node_rank}",
+            f"--master_addr={master_addr}",
+            "--master_port=1234",
+            "--nproc_per_node",
+            str(num_gpus_per_node),
+            "-m",
+            "fast_scgpt.train_ddp",
+            "--slaf_path",
+            slaf_path,
+            "--n_steps",
+            str(n_steps),
+            "--batch_size",
+            str(batch_size),
+            "--max_genes",
+            str(max_genes),
+            "--learning_rate",
+            str(learning_rate),
+            "--log_every",
+            str(log_every),
+            "--model_size",
+            model_size,
+        ]
     if use_gradient_checkpointing:
         cmd.append("--use_gradient_checkpointing")
     if profile:
         cmd.append("--profile")
-    _ = use_compile  # Not yet implemented in train_ddp.py
+    _ = use_compile
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")
 
-    # Run distributed training
-    start_time = __import__("time").time()
+    start_time = time.time()
     summary = None
-
     try:
         subprocess.run(
             cmd,
             cwd="/root",
-            capture_output=False,  # Stream output directly
+            capture_output=False,
             check=True,
         )
-        elapsed = __import__("time").time() - start_time
-        effective_batch = batch_size * num_gpus
+        elapsed = time.time() - start_time
+        effective_batch = batch_size * num_gpus_total
         summary = {
             "status": "success",
             "n_steps": n_steps,
             "batch_size_per_gpu": batch_size,
             "effective_batch_size": effective_batch,
-            "num_gpus": num_gpus,
+            "num_gpus": num_gpus_total,
+            "num_nodes": num_nodes,
             "max_genes": max_genes,
             "model_size": model_size,
             "elapsed_sec": elapsed,
@@ -231,35 +278,35 @@ def train_distributed_on_modal(
         logger.error(f"Training failed with exit code {e.returncode}")
         summary = {"error": f"Training failed: {e}"}
     finally:
-        # Remove run-specific queue and dict so they don't accumulate in the workspace
-        import asyncio
+        should_cleanup = not is_multinode or node_rank == 0
+        if should_cleanup:
+            import asyncio
 
-        async def _cleanup() -> None:
-            try:
-                await modal.Queue.objects.delete(
-                    queue_name, allow_missing=True, environment_name="main"
-                )
-                logger.info(f"Cleaned up queue: {queue_name}")
-            except Exception as e:
-                logger.warning(f"Cleanup queue failed (non-fatal): {e}")
-            dict_name = f"{queue_name}-partial-groups"
-            try:
-                await modal.Dict.objects.delete(
-                    dict_name, allow_missing=True, environment_name="main"
-                )
-                logger.info(f"Cleaned up dict: {dict_name}")
-            except Exception as e:
-                logger.warning(f"Cleanup dict failed (non-fatal): {e}")
+            async def _cleanup() -> None:
+                try:
+                    await modal.Queue.objects.delete(
+                        queue_name, allow_missing=True, environment_name="main"
+                    )
+                    logger.info(f"Cleaned up queue: {queue_name}")
+                except Exception as e:
+                    logger.warning(f"Cleanup queue failed (non-fatal): {e}")
+                try:
+                    await modal.Dict.objects.delete(
+                        dict_name, allow_missing=True, environment_name="main"
+                    )
+                    logger.info(f"Cleaned up dict: {dict_name}")
+                except Exception as e:
+                    logger.warning(f"Cleanup dict failed (non-fatal): {e}")
 
-        try:
-            asyncio.run(_cleanup())
-        except Exception as cleanup_err:
-            logger.warning(f"Cleanup queue/dict failed (non-fatal): {cleanup_err}")
+            try:
+                asyncio.run(_cleanup())
+            except Exception as cleanup_err:
+                logger.warning(f"Cleanup queue/dict failed (non-fatal): {cleanup_err}")
 
     if summary is None:
         summary = {"error": "Training did not produce a summary"}
 
-    if summary.get("status") == "success":
+    if summary.get("status") == "success" and should_cleanup:
         import json
         from datetime import datetime
 
@@ -274,6 +321,80 @@ def train_distributed_on_modal(
     return summary
 
 
+@app.function(
+    image=image,
+    gpu="H100:8",
+    timeout=14400,  # 4 hours max
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+)
+def train_distributed_on_modal(
+    batch_size: int = 64,
+    max_genes: int = 1024,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "base",
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """Run distributed training on 8x H100 Modal (single node)."""
+    return _run_training(
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        model_size=model_size,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        profile=profile,
+        data_source=data_source,
+        cluster_info=None,
+    )
+
+
+@app.function(
+    image=image,
+    gpu="H100:8",
+    timeout=14400,
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+    # EFA unlocks extra capacity on H100 multi-node; see modal-labs/multinode-training-guide benchmark
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=2, rdma=True)
+def train_distributed_multinode_on_modal(
+    batch_size: int = 64,
+    max_genes: int = 1024,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "base",
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """Run distributed training on 2 nodes x 8x H100 (16 GPUs). Multi-node (Beta)."""
+    cluster_info = modal.experimental.get_cluster_info()
+    return _run_training(
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        model_size=model_size,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        profile=profile,
+        data_source=data_source,
+        cluster_info=cluster_info,
+    )
+
+
 @app.local_entrypoint()
 def main(
     batch_size: int = 64,
@@ -286,6 +407,7 @@ def main(
     use_compile: bool = False,
     profile: bool = False,
     data_source: str = "s3",
+    multinode: bool = False,
 ) -> None:
     """Run distributed training benchmark from local machine.
 
@@ -300,12 +422,19 @@ def main(
         use_compile: Use torch.compile for fused kernels
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
+        multinode: If True, run on 2 nodes (16x H100). Default False = single node (8x H100).
     """
-    # Estimate effective batch size
-    num_gpus = 8  # H100:8 configuration
+    if multinode:
+        num_gpus = 16  # 2 nodes x 8
+        train_fn = train_distributed_multinode_on_modal
+        mode = "2 nodes (16x H100)"
+    else:
+        num_gpus = 8
+        train_fn = train_distributed_on_modal
+        mode = "8x H100"
     effective_batch = batch_size * num_gpus
 
-    print("Launching fast-scGPT DISTRIBUTED training on Modal (8x H100)...")
+    print(f"Launching fast-scGPT DISTRIBUTED training on Modal ({mode})...")
     print(f"  batch_size_per_gpu={batch_size}, effective_batch={effective_batch}")
     print(f"  max_genes={max_genes}, n_steps={n_steps}")
     print(f"  model_size={model_size}, lr={learning_rate}")
@@ -313,9 +442,10 @@ def main(
     print(f"  use_compile={use_compile}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
+    print(f"  multinode={multinode}")
     print()
 
-    result = train_distributed_on_modal.remote(
+    result = train_fn.remote(
         batch_size=batch_size,
         max_genes=max_genes,
         n_steps=n_steps,
@@ -337,6 +467,8 @@ def main(
         print("Status: SUCCESS")
         print(f"Steps completed: {result['n_steps']}")
         print(f"GPUs used: {result['num_gpus']}")
+        if result.get("num_nodes"):
+            print(f"Nodes: {result['num_nodes']}")
         print(f"Batch size per GPU: {result['batch_size_per_gpu']}")
         print(f"Effective batch size: {result['effective_batch_size']}")
         print(f"Max genes: {result['max_genes']}")
