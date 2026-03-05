@@ -44,6 +44,9 @@ modal = [
 distributed = [
     "accelerate>=0.27",
 ]
+scripts = [
+    "rich>=13.0",
+]
 
 [build-system]
 requires = ["hatchling"]
