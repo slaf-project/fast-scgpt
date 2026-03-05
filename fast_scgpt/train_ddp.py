@@ -8,6 +8,7 @@ Usage (Modal sets SLAF_QUEUE_NAME before torchrun):
 """
 
 import argparse
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -417,6 +418,27 @@ def train_ddp(
     # Summary
     elapsed = time.time() - start_time
     summary = metrics.summary()
+
+    # All-reduce peak memory so we report max across ranks; rank 0 writes metrics for Modal
+    peak_gb_tensor = torch.tensor(
+        [summary["peak_memory_gb"]], dtype=torch.float32, device=device
+    )
+    dist.all_reduce(peak_gb_tensor, op=dist.ReduceOp.MAX)
+    util_pct_tensor = torch.tensor(
+        [summary["memory_utilization_pct"]], dtype=torch.float32, device=device
+    )
+    dist.all_reduce(util_pct_tensor, op=dist.ReduceOp.MAX)
+    # Use sum of step times (actual compute) so Modal reports same throughput as this log
+    training_elapsed_sec = sum(metrics._step_times) / 1000.0
+    metrics_for_modal = {
+        "peak_memory_gb": round(peak_gb_tensor.item(), 2),
+        "memory_utilization_pct": round(util_pct_tensor.item(), 1),
+        "training_elapsed_sec": round(training_elapsed_sec, 2),
+    }
+    metrics_file = os.environ.get("FAST_SCGPT_METRICS_FILE")
+    if is_main and metrics_file:
+        with open(metrics_file, "w") as f:
+            json.dump(metrics_for_modal, f, indent=2)
 
     if is_main:
         # Release producer loader before barrier/cleanup so its teardown (threads, Modal)

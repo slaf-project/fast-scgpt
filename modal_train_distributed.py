@@ -25,6 +25,7 @@ Results are saved to /data/benchmark_results/ on the volume.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from typing import Any
@@ -190,6 +191,10 @@ def _run_training(
         f"SLAF_QUEUE_NAME={queue_name}"
         + (f" (cluster_id, node_rank={node_rank})" if is_multinode else "")
     )
+    metrics_file_path = "/tmp/fast_scgpt_metrics.json"
+    os.environ["FAST_SCGPT_METRICS_FILE"] = (
+        metrics_file_path  # train_ddp rank 0 writes peak memory here
+    )
 
     modal.Queue.objects.create(queue_name, allow_existing=True, environment_name="main")
     logger.info("Queue created in workspace (main)")
@@ -274,6 +279,18 @@ def _run_training(
             "elapsed_sec": elapsed,
             "gpu_name": torch.cuda.get_device_name(0),
         }
+        # Merge peak memory from train_ddp (rank 0 writes to metrics file)
+        try:
+            with open(metrics_file_path) as f:
+                summary.update(json.load(f))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Could not read metrics file (non-fatal): {e}")
+        # MFU, achieved TFLOPS, throughput, steps/sec
+        from fast_scgpt.training_metrics import compute_training_metrics
+
+        summary.update(compute_training_metrics(summary))
     except subprocess.CalledProcessError as e:
         logger.error(f"Training failed with exit code {e.returncode}")
         summary = {"error": f"Training failed: {e}"}
@@ -307,7 +324,6 @@ def _run_training(
         summary = {"error": "Training did not produce a summary"}
 
     if summary.get("status") == "success" and should_cleanup:
-        import json
         from datetime import datetime
 
         results_dir = "/data/benchmark_results"
@@ -476,6 +492,22 @@ def main(
         print(f"GPU: {result['gpu_name']}")
         print()
         print(f"Total elapsed time: {result['elapsed_sec']:.1f}s")
+        if result.get("training_elapsed_sec") is not None:
+            print(f"Training time (compute): {result['training_elapsed_sec']:.1f}s")
+        if "mfu_pct" in result:
+            print(f"MFU: {result['mfu_pct']}%")
+        if "achieved_tflops_total" in result:
+            print(f"Achieved TFLOPS (total): {result['achieved_tflops_total']}")
+        if "achieved_tflops_per_gpu" in result:
+            print(f"Achieved TFLOPS (per GPU): {result['achieved_tflops_per_gpu']}")
+        if "throughput_cells_per_sec" in result:
+            print(f"Throughput: {result['throughput_cells_per_sec']:.0f} cells/sec")
+        if "steps_per_sec" in result:
+            print(f"Steps/sec: {result['steps_per_sec']}")
+        if "peak_memory_gb" in result:
+            print(f"Peak GPU memory: {result['peak_memory_gb']:.2f} GB")
+        if "memory_utilization_pct" in result:
+            print(f"Memory utilization: {result['memory_utilization_pct']:.1f}%")
     else:
         print("Status: FAILED")
         print(f"Error: {result.get('error', 'Unknown error')}")

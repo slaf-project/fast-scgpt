@@ -216,6 +216,9 @@ def train_on_modal(
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Run training
+    import time
+
+    start_time = time.time()
     metrics = train(
         slaf_path=slaf_path,
         config=config,
@@ -229,16 +232,24 @@ def train_on_modal(
         use_compile=use_compile,
         profile=profile,
     )
+    elapsed_sec = time.time() - start_time
 
     # Build results dict (median excludes first batch warmup)
     summary = metrics.summary()
     median_ms = summary["median_step_time_ms"]
+    effective_batch = batch_size * gradient_accumulation_steps
+    training_elapsed_sec = sum(metrics._step_times) / 1000.0
+
     result = {
         "status": "success",
         "n_steps": n_steps,
         "batch_size": batch_size,
+        "effective_batch_size": effective_batch,
         "max_genes": max_genes,
         "model_size": model_size,
+        "elapsed_sec": round(elapsed_sec, 1),
+        "training_elapsed_sec": round(training_elapsed_sec, 2),
+        "num_gpus": 1,
         "avg_step_time_ms": summary["avg_step_time_ms"],
         "median_step_time_ms": median_ms,
         "median_cells_per_sec": (
@@ -250,6 +261,11 @@ def train_on_modal(
         "memory_utilization_pct": summary["memory_utilization_pct"],
         "gpu_name": torch.cuda.get_device_name(0),
     }
+
+    # MFU, achieved TFLOPS, throughput, steps/sec (comparable to distributed benchmarks)
+    from fast_scgpt.training_metrics import compute_training_metrics
+
+    result.update(compute_training_metrics(result))
 
     # Save results to volume for detached runs
     import json
@@ -346,13 +362,29 @@ def main(
         print("Status: SUCCESS")
         print(f"Steps completed: {result['n_steps']}")
         print(f"Batch size: {result['batch_size']}")
+        if result.get("effective_batch_size"):
+            print(f"Effective batch size: {result['effective_batch_size']}")
         print(f"Max genes: {result['max_genes']}")
         print(f"Model size: {result['model_size']}")
+        print(f"GPU: {result['gpu_name']}")
+        print()
+        print(f"Total elapsed time: {result.get('elapsed_sec', 0):.1f}s")
+        if result.get("training_elapsed_sec") is not None:
+            print(f"Training time (compute): {result['training_elapsed_sec']:.1f}s")
+        if "mfu_pct" in result:
+            print(f"MFU: {result['mfu_pct']}%")
+        if "achieved_tflops_total" in result:
+            print(f"Achieved TFLOPS (total): {result['achieved_tflops_total']}")
+        if "achieved_tflops_per_gpu" in result:
+            print(f"Achieved TFLOPS (per GPU): {result['achieved_tflops_per_gpu']}")
+        if "throughput_cells_per_sec" in result:
+            print(f"Throughput: {result['throughput_cells_per_sec']:.0f} cells/sec")
+        if "steps_per_sec" in result:
+            print(f"Steps/sec: {result['steps_per_sec']}")
         print()
         print("Performance (excludes first batch warmup):")
         print(f"  Median step time: {result['median_step_time_ms']:.1f} ms")
         print(f"  Avg step time: {result['avg_step_time_ms']:.1f} ms")
-        print(f"  Throughput: {result['median_cells_per_sec']:.0f} cells/sec")
         print(f"  Total cells: {result['total_cells']:,}")
         print(f"  Total tokens: {result['total_tokens']:,}")
         print()
