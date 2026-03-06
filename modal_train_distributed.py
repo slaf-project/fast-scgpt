@@ -84,6 +84,7 @@ def _run_training(
     n_steps: int,
     learning_rate: float,
     log_every: int,
+    gradient_accumulation_steps: int,
     model_size: str,
     use_gradient_checkpointing: bool,
     use_compile: bool,
@@ -218,6 +219,8 @@ def _run_training(
         str(learning_rate),
         "--log_every",
         str(log_every),
+        "--gradient_accumulation_steps",
+        str(gradient_accumulation_steps),
         "--model_size",
         model_size,
     ]
@@ -244,14 +247,17 @@ def _run_training(
             str(learning_rate),
             "--log_every",
             str(log_every),
+            "--gradient_accumulation_steps",
+            str(gradient_accumulation_steps),
             "--model_size",
             model_size,
         ]
     if use_gradient_checkpointing:
         cmd.append("--use_gradient_checkpointing")
+    if use_compile:
+        cmd.append("--use_compile")
     if profile:
         cmd.append("--profile")
-    _ = use_compile
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -266,7 +272,7 @@ def _run_training(
             check=True,
         )
         elapsed = time.time() - start_time
-        effective_batch = batch_size * num_gpus_total
+        effective_batch = batch_size * gradient_accumulation_steps * num_gpus_total
         summary = {
             "status": "success",
             "n_steps": n_steps,
@@ -350,6 +356,7 @@ def train_distributed_on_modal(
     n_steps: int = 500,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
@@ -363,6 +370,7 @@ def train_distributed_on_modal(
         n_steps=n_steps,
         learning_rate=learning_rate,
         log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
@@ -388,6 +396,7 @@ def train_distributed_multinode_on_modal(
     n_steps: int = 500,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
@@ -402,6 +411,7 @@ def train_distributed_multinode_on_modal(
         n_steps=n_steps,
         learning_rate=learning_rate,
         log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
@@ -418,6 +428,7 @@ def main(
     n_steps: int = 500,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
@@ -433,6 +444,7 @@ def main(
         n_steps: Training steps (default: 500)
         learning_rate: LR (default: 1e-4)
         log_every: Log interval (default: 1)
+        gradient_accumulation_steps: Accumulate gradients over N micro-steps (default: 1)
         model_size: small/base/large (default: base)
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
@@ -448,12 +460,15 @@ def main(
         num_gpus = 8
         train_fn = train_distributed_on_modal
         mode = "8x H100"
-    effective_batch = batch_size * num_gpus
+    effective_batch = batch_size * gradient_accumulation_steps * num_gpus
 
     print(f"Launching fast-scGPT DISTRIBUTED training on Modal ({mode})...")
-    print(f"  batch_size_per_gpu={batch_size}, effective_batch={effective_batch}")
+    print(
+        f"  batch_size_per_gpu={batch_size}, grad_accum={gradient_accumulation_steps}, effective_batch={effective_batch}"
+    )
     print(f"  max_genes={max_genes}, n_steps={n_steps}")
     print(f"  model_size={model_size}, lr={learning_rate}")
+    print(f"  gradient_accumulation_steps={gradient_accumulation_steps}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
     print(f"  profile={profile}")
@@ -467,6 +482,7 @@ def main(
         n_steps=n_steps,
         learning_rate=learning_rate,
         log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,

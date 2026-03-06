@@ -372,6 +372,7 @@ def train(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
     profile: bool = False,
 ) -> GPUMetrics:
     """Train ScGPT on SLAF data.
@@ -390,6 +391,8 @@ def train(
             activation memory by ~50% (trades compute for memory)
         use_compile: Use torch.compile for fused kernels and potential speedup
             (may increase compilation time on first step)
+        compile_mode: torch.compile mode: "reduce-overhead" (default, faster compile),
+            "max-autotune" (slower compile, often better MFU at large batch), or "default"
         profile: Log timing breakdown (data/mask/forward/backward/optim)
 
     Returns:
@@ -449,8 +452,8 @@ def train(
 
     # Optional: torch.compile for fused kernels and speedup
     if use_compile and device.type == "cuda":
-        logger.info("Compiling model with torch.compile (mode='reduce-overhead')...")
-        model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
+        logger.info("Compiling model with torch.compile (mode={})...", compile_mode)
+        model = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
         logger.info("Model compiled successfully")
     elif use_compile:
         logger.warning("torch.compile requested but not on CUDA - skipping")

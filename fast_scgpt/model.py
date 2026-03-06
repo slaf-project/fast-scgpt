@@ -75,14 +75,17 @@ class TokenEmbedding(nn.Module):
         Returns:
             Embeddings of shape (batch, seq_len, d_model)
         """
-        # Check for out-of-bounds tokens (helps debug SLAF vocab mismatches)
-        max_token = x.max().item()
-        if max_token >= self.embedding.num_embeddings:
-            raise ValueError(
-                f"Token ID {max_token} exceeds embedding vocab size "
-                f"{self.embedding.num_embeddings}. Check config.vocab_size "
-                f"matches SLAF tokenizer vocabulary."
-            )
+        # Bounds check breaks torch.compile (Dynamo evaluate_expr on .item() and
+        # Python int comparison). Skip when compiling; training loop uses
+        # clip_expression_tokens before the forward.
+        if not torch.compiler.is_compiling():
+            max_token = x.max().item()
+            if max_token >= self.embedding.num_embeddings:
+                raise ValueError(
+                    f"Token ID {max_token} exceeds embedding vocab size "
+                    f"{self.embedding.num_embeddings}. Check config.vocab_size "
+                    f"matches SLAF tokenizer vocabulary."
+                )
         result: torch.Tensor = self.embedding(x) * self.scale
         return result
 

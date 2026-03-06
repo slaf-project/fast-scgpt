@@ -73,6 +73,7 @@ def train_on_modal(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
     use_swiglu: bool = False,
     use_lp_layernorm: bool = False,
     use_softcap: bool = False,
@@ -97,6 +98,7 @@ def train_on_modal(
             Effective batch = batch_size * gradient_accumulation_steps
         use_gradient_checkpointing: Trade compute for ~50% activation memory savings
         use_compile: Use torch.compile for fused kernels (may speed up training)
+        compile_mode: "reduce-overhead" | "max-autotune" | "default" (for MFU try max-autotune)
         use_swiglu: Use SwiGLU activation (Llama-style) instead of GELU
         use_lp_layernorm: Force LayerNorm to stay in bf16 (Tahoe-X1 optimization)
         use_softcap: Apply logit softcapping to prevent extreme logits (nanochat)
@@ -230,6 +232,7 @@ def train_on_modal(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        compile_mode=compile_mode,
         profile=profile,
     )
     elapsed_sec = time.time() - start_time
@@ -296,6 +299,7 @@ def main(
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
     use_swiglu: bool = False,
     use_lp_layernorm: bool = False,
     use_softcap: bool = False,
@@ -315,6 +319,7 @@ def main(
         gradient_accumulation_steps: Effective batch = batch_size * this
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
+        compile_mode: reduce-overhead (default) or max-autotune for better MFU
         use_swiglu: Use SwiGLU activation instead of GELU
         use_lp_layernorm: Force LayerNorm to stay in bf16
         use_softcap: Apply logit softcapping (nanochat)
@@ -329,6 +334,7 @@ def main(
     print(f"  effective_batch_size={effective_batch}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
+    print(f"  compile_mode={compile_mode}")
     print(f"  use_swiglu={use_swiglu}")
     print(f"  use_lp_layernorm={use_lp_layernorm}")
     print(f"  use_softcap={use_softcap}")
@@ -346,6 +352,7 @@ def main(
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        compile_mode=compile_mode,
         use_swiglu=use_swiglu,
         use_lp_layernorm=use_lp_layernorm,
         use_softcap=use_softcap,

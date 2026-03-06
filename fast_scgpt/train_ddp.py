@@ -140,7 +140,9 @@ def train_ddp(
     max_genes: int = 512,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
     profile: bool = False,
 ) -> DistributedMetrics:
     """Train with native PyTorch DDP."""
@@ -233,6 +235,32 @@ def train_ddp(
     base_model = ScGPT(
         config, use_gradient_checkpointing=use_gradient_checkpointing
     ).to(device)
+    if use_compile and device.type == "cuda":
+        # DDP optimizer in Dynamo doesn't support higher-order ops (e.g. from
+        # autograd through compiled backward). Disable it to avoid NotImplementedError.
+        # See https://github.com/pytorch/pytorch/issues/104674
+        torch._dynamo.config.optimize_ddp = False
+        # Capture .item() and other scalar outputs in the graph to avoid graph breaks
+        torch._dynamo.config.capture_scalar_outputs = True
+        # Disable Inductor CUDA graphs to avoid OOM (they use large private pools).
+        # Saves several GB per GPU; may slightly reduce throughput.
+        try:
+            if hasattr(torch._inductor.config, "triton") and hasattr(
+                torch._inductor.config.triton, "cudagraphs"
+            ):
+                torch._inductor.config.triton.cudagraphs = False
+            elif hasattr(torch._inductor.config, "cudagraphs"):
+                torch._inductor.config.cudagraphs = False
+        except Exception:
+            pass
+        if is_main:
+            logger.info(
+                "Compiling model with torch.compile (mode='reduce-overhead', dynamic=True, cudagraphs=off)..."
+            )
+        # dynamic=True reduces recompilation when input/mask shapes or sizes vary step-to-step
+        base_model = torch.compile(base_model, mode="reduce-overhead", dynamic=True)  # type: ignore[assignment]
+        if is_main:
+            logger.info("Model compiled successfully")
     model = DDP(base_model, device_ids=[device.index])
 
     if is_main:
@@ -264,12 +292,16 @@ def train_ddp(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    effective_batch = batch_size * gradient_accumulation_steps * world_size
     if is_main:
         logger.info(
-            f"Starting training: {n_steps} steps, batch={batch_size}, effective={batch_size * world_size}"
+            f"Starting training: {n_steps} steps, batch={batch_size}, "
+            f"grad_accum={gradient_accumulation_steps}, effective={effective_batch}"
         )
 
     step = 0
+    micro_step = 0
+    accum_step_ms = 0.0
     total_loss = 0.0
     start_time = time.time()
     first_loss = None
@@ -280,6 +312,8 @@ def train_ddp(
     accum_forward_ms = 0.0
     accum_backward_ms = 0.0
     accum_optim_ms = 0.0
+
+    optimizer.zero_grad()
 
     while step < n_steps:
         t_dl_start = time.perf_counter()
@@ -305,6 +339,9 @@ def train_ddp(
         dl_ms = (t_dl_end - t_dl_start) * 1000
 
         step_start = time.perf_counter()
+
+        if micro_step == 0:
+            optimizer.zero_grad()
 
         # Forward pass
         model.train()
@@ -347,26 +384,30 @@ def train_ddp(
             expr_loss = torch.nn.functional.cross_entropy(
                 expr_logits[expr_mask], expr_targets[valid_gene_mask], ignore_index=-100
             )
-            loss = gene_loss + expr_loss
+            loss = (gene_loss + expr_loss) / gradient_accumulation_steps
 
         if profile and device.type == "cuda":
             torch.cuda.synchronize(device)
         t_forward = time.perf_counter()
 
-        # Backward
-        optimizer.zero_grad()
+        # Backward (gradients accumulate across micro-steps)
         loss.backward()
 
         if profile and device.type == "cuda":
             torch.cuda.synchronize(device)
         t_backward = time.perf_counter()
 
-        optimizer.step()
+        micro_step += 1
+        is_accumulation_boundary = micro_step >= gradient_accumulation_steps
+
+        if is_accumulation_boundary:
+            optimizer.step()
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t_optim = time.perf_counter()
         step_time_ms = (t_optim - step_start) * 1000
+        accum_step_ms += step_time_ms
 
         if profile:
             mask_ms = (t_mask - t_after_clip) * 1000
@@ -379,17 +420,24 @@ def train_ddp(
             accum_backward_ms += backward_ms
             accum_optim_ms += optim_ms
 
-        metrics.update(step_time_ms, batch_size, device)
-        loss_val = loss.item()
+        loss_val = loss.item() * gradient_accumulation_steps  # unscaled for logging
         total_loss += loss_val
         last_loss = loss_val
         if first_loss is None:
             first_loss = loss_val
 
-        step += 1
+        if is_accumulation_boundary:
+            metrics.update(
+                accum_step_ms,
+                batch_size * gradient_accumulation_steps,
+                device,
+            )
+            step += 1
+            micro_step = 0
+            accum_step_ms = 0.0
 
-        if is_main and step % log_every == 0:
-            avg_loss = total_loss / log_every
+        if is_main and is_accumulation_boundary and step % log_every == 0:
+            avg_loss = total_loss / (log_every * gradient_accumulation_steps)
             logger.info(
                 f"Step {step}/{n_steps} | Loss: {avg_loss:.4f} | "
                 f"Time: {metrics.step_time_ms:.0f}ms | "
@@ -398,7 +446,12 @@ def train_ddp(
             )
             total_loss = 0.0
 
-        if step % log_every == 0 and profile and accum_forward_ms > 0:
+        if (
+            is_accumulation_boundary
+            and step % log_every == 0
+            and profile
+            and accum_forward_ms > 0
+        ):
             _log_timing_all_ranks(
                 rank,
                 is_main,
@@ -474,9 +527,20 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over N micro-steps before optimizer step (effective_batch = batch_size * this * world_size)",
+    )
+    parser.add_argument(
         "--model_size", type=str, default="small", choices=["small", "base", "large"]
     )
     parser.add_argument("--use_gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        help="Use torch.compile for fused kernels (improves MFU)",
+    )
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -499,7 +563,9 @@ def main() -> None:
         max_genes=args.max_genes,
         learning_rate=args.learning_rate,
         log_every=args.log_every,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
+        use_compile=args.use_compile,
         profile=args.profile,
     )
 
