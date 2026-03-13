@@ -34,7 +34,7 @@ slaf_volume = modal.Volume.from_name("slaf-datasets")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
-    .pip_install(
+    .uv_pip_install(
         "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
         "einops>=0.7",
         "numpy>=1.24",
