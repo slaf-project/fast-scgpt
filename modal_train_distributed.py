@@ -1,8 +1,13 @@
 """Modal distributed training script for fast-scGPT on 8x H100.
 
-Uses queue-based distributed dataloader from slaf (PR #24 distributed_dataloader).
-Requires the slaf app to be deployed first: from slaf repo, distributed_dataloader branch:
-  modal deploy slaf/ml/distributed.py
+Uses queue-based distributed dataloader from slaf (via slafdb).
+The script deploys the SLAF distributed dataloader Modal app automatically
+before training (via slaf.ml.distributed.deploy_dataloader_app), so no separate
+deploy step is required.
+
+CPU producer workers (spawned by rank 0 in train_ddp) are stopped explicitly when
+training completes so they do not keep running after the benchmark (avoids extra cost).
+Queue and Dict are cleaned up in this script's finally block.
 
 Usage:
     # Single node (8x H100)
@@ -39,7 +44,7 @@ app = modal.App("fast-scgpt-distributed")
 # Mount existing Modal volume with SLAF datasets
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
-# Build image with CUDA + dependencies; slaf from distributed_dataloader for queue-based dataloader
+# Build image with CUDA + dependencies; slafdb for queue-based distributed dataloader
 # libhwloc15, libnl-route-3-200 (and ibverbs) needed for efa_enabled on multi-node
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -63,10 +68,7 @@ image = (
         "ninja",
         "modal",
         "accelerate>=0.27",
-    )
-    # slaf with distributed dataloader (queue-based, multi-consumer)
-    .uv_pip_install(
-        "git+https://github.com/slaf-project/slaf.git@distributed_dataloader",
+        "slafdb",
     )
     # Flash Attention - FA3 on H100
     .uv_pip_install(
@@ -307,14 +309,14 @@ def _run_training(
 
             async def _cleanup() -> None:
                 try:
-                    await modal.Queue.objects.delete(
+                    await modal.Queue.objects.delete.aio(
                         queue_name, allow_missing=True, environment_name="main"
                     )
                     logger.info(f"Cleaned up queue: {queue_name}")
                 except Exception as e:
                     logger.warning(f"Cleanup queue failed (non-fatal): {e}")
                 try:
-                    await modal.Dict.objects.delete(
+                    await modal.Dict.objects.delete.aio(
                         dict_name, allow_missing=True, environment_name="main"
                     )
                     logger.info(f"Cleaned up dict: {dict_name}")
@@ -345,7 +347,7 @@ def _run_training(
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="A100:2",
     timeout=14400,  # 4 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -438,6 +440,10 @@ def main(
 ) -> None:
     """Run distributed training benchmark from local machine.
 
+    Ensures the SLAF distributed dataloader Modal app is deployed (via
+    deploy_dataloader_app) before launching training, so everything is
+    controlled from this repo.
+
     Args:
         batch_size: Batch size per GPU (default: 64)
         max_genes: Max genes per cell (default: 1024)
@@ -461,6 +467,18 @@ def main(
         train_fn = train_distributed_on_modal
         mode = "8x H100"
     effective_batch = batch_size * gradient_accumulation_steps * num_gpus
+
+    # Deploy SLAF distributed dataloader app so training can spawn dataloader workers.
+    try:
+        from slaf.ml.distributed import deploy_dataloader_app
+
+        deploy_dataloader_app(show_logs=False, cpu=2, memory=8192)
+    except ImportError as e:
+        print(
+            "ERROR: Could not import deploy_dataloader_app from slaf.ml.distributed. "
+            "Ensure slafdb[ml] is installed and up to date (see slaf-project/slaf)."
+        )
+        raise SystemExit(1) from e
 
     print(f"Launching fast-scGPT DISTRIBUTED training on Modal ({mode})...")
     print(

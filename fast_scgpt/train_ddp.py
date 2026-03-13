@@ -27,6 +27,22 @@ from fast_scgpt.train import clip_expression_tokens, create_mask
 _IDX_DL, _IDX_MASK, _IDX_FWD, _IDX_BWD, _IDX_OPT, _IDX_COMPUTE, _IDX_TOTAL = range(7)
 
 
+def _stop_producer_workers(producer_loader: object) -> None:
+    """Stop Modal CPU producer workers so they don't keep running after training.
+
+    Calls DistributedSLAFDataLoader.stop_prefetch_workers() (slaf stable API).
+    """
+    if producer_loader is None:
+        return
+    try:
+        producer_loader.stop_prefetch_workers()
+        logger.info("Producer loader.stop_prefetch_workers() completed")
+    except Exception as e:
+        logger.warning(
+            "Producer loader.stop_prefetch_workers() failed (non-fatal): %s", e
+        )
+
+
 @dataclass
 class DistributedMetrics:
     """Metrics for distributed training."""
@@ -180,7 +196,7 @@ def train_ddp(
             from slaf.ml.distributed import DistributedSLAFDataLoader
         except ImportError as e:
             raise ImportError(
-                "slaf with distributed dataloader required (pip install git+https://github.com/slaf-project/slaf.git@distributed_dataloader)"
+                "slaf with distributed dataloader required (pip install slafdb)"
             ) from e
 
         logger.info(f"Loading SLAF from: {slaf_path}")
@@ -199,7 +215,7 @@ def train_ddp(
             vocab_size=vocab_size,
             n_expression_bins=config.n_expression_bins,
             queue_name=queue_name,
-            n_workers=8,
+            n_workers=2,
             n_scanners=8,
             prefetch_batch_size=16_384,
             prefetch_batch_count=16,
@@ -494,6 +510,8 @@ def train_ddp(
             json.dump(metrics_for_modal, f, indent=2)
 
     if is_main:
+        # Stop Modal CPU producer workers so they don't keep running (avoid burning $).
+        _stop_producer_workers(_producer_loader_ref)
         # Release producer loader before barrier/cleanup so its teardown (threads, Modal)
         # runs while process group is still alive; avoids SIGABRT on process exit.
         _producer_loader_ref = None
