@@ -194,8 +194,8 @@ def clip_expression_tokens(
 ) -> torch.Tensor:
     """Clip expression tokens to valid range.
 
-    Workaround for SLAF tokenizer bug where integer expression values
-    bypass clipping (see PRDs/BUG-slaf-tokenizer-expression-clipping.md).
+    Defensive clamp: some tokenizer paths can emit expression bin IDs outside
+    the configured range.
 
     Expression tokens are at positions vocab_size + bin_id.
     This clips bin_id to [0, n_expression_bins - 1].
