@@ -85,6 +85,9 @@ dmypy.json
 *~
 
 # Project specific
+# Product / planning notes — keep locally; not shipped with the public repo
+PRDs/
+
 *.slaf
 *.h5ad
 *.lance/
