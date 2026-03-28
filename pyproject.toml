@@ -41,9 +41,6 @@ cuda = [
 modal = [
     "modal>=0.60",
 ]
-distributed = [
-    "accelerate>=0.27",
-]
 scripts = [
     "rich>=13.0",
 ]

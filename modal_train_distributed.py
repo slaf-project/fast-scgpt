@@ -67,7 +67,6 @@ image = (
         "packaging",
         "ninja",
         "modal",
-        "accelerate>=0.27",
         "slafdb",
     )
     # Flash Attention - FA3 on H100
