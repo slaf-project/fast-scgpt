@@ -16,6 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import torch
 from loguru import logger
@@ -374,6 +375,7 @@ def train(
     use_compile: bool = False,
     compile_mode: str = "reduce-overhead",
     profile: bool = False,
+    use_strict_bf16: bool = False,
 ) -> GPUMetrics:
     """Train ScGPT on SLAF data.
 
@@ -394,6 +396,7 @@ def train(
         compile_mode: torch.compile mode: "reduce-overhead" (default, faster compile),
             "max-autotune" (slower compile, often better MFU at large batch), or "default"
         profile: Log timing breakdown (data/mask/forward/backward/optim)
+        use_strict_bf16: Keep weights/compute in bf16 without autocast (CUDA bf16 only)
 
     Returns:
         GPUMetrics with training statistics
@@ -450,6 +453,21 @@ def train(
     )
     logger.info("Model parameters: {:,}", model.num_parameters)
 
+    strict_bf16_active = False
+    if use_strict_bf16:
+        if device.type != "cuda":
+            logger.warning("use_strict_bf16 ignored: not on CUDA")
+        elif not torch.cuda.is_bf16_supported():
+            logger.warning("use_strict_bf16 ignored: bf16 not supported on this GPU")
+        else:
+            from fast_scgpt.strict_bf16 import convert_to_strict_bf16
+
+            model = cast(ScGPT, convert_to_strict_bf16(model))
+            strict_bf16_active = True
+            logger.info(
+                "Strict BF16: model in bf16, autocast disabled for training step"
+            )
+
     # Optional: torch.compile for fused kernels and speedup
     if use_compile and device.type == "cuda":
         logger.info("Compiling model with torch.compile (mode={})...", compile_mode)
@@ -469,8 +487,8 @@ def train(
         betas=(0.9, 0.95),
     )
 
-    # Mixed precision training (CUDA only)
-    use_amp = device.type == "cuda"
+    # Mixed precision training (CUDA only; disabled when strict bf16 owns dtypes)
+    use_amp = device.type == "cuda" and not strict_bf16_active
     scaler = torch.amp.GradScaler() if use_amp else None
     if use_amp:
         amp_dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
@@ -825,6 +843,11 @@ def main() -> None:
         default="small",
         help="Model size preset",
     )
+    parser.add_argument(
+        "--use_strict_bf16",
+        action="store_true",
+        help="Train with model weights in bf16 and no autocast (CUDA bf16 GPUs only)",
+    )
 
     args = parser.parse_args()
 
@@ -850,6 +873,7 @@ def main() -> None:
         max_genes=args.max_genes,
         learning_rate=args.learning_rate,
         log_every=args.log_every,
+        use_strict_bf16=args.use_strict_bf16,
     )
 
 

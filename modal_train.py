@@ -234,6 +234,7 @@ def train_on_modal(
         use_compile=use_compile,
         compile_mode=compile_mode,
         profile=profile,
+        use_strict_bf16=use_strict_bf16,
     )
     elapsed_sec = time.time() - start_time
 
@@ -338,6 +339,7 @@ def main(
     print(f"  use_swiglu={use_swiglu}")
     print(f"  use_lp_layernorm={use_lp_layernorm}")
     print(f"  use_softcap={use_softcap}")
+    print(f"  use_strict_bf16={use_strict_bf16}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print()
@@ -356,6 +358,7 @@ def main(
         use_swiglu=use_swiglu,
         use_lp_layernorm=use_lp_layernorm,
         use_softcap=use_softcap,
+        use_strict_bf16=use_strict_bf16,
         profile=profile,
         data_source=data_source,
     )
