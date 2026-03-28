@@ -3,7 +3,7 @@ name = "fast-scgpt"
 version = "0.1.0"
 description = "Fast reimplementation of scGPT with modded-nanogpt innovations"
 readme = "README.md"
-license = { text = "MIT" }
+license = { file = "LICENSE.md" }
 requires-python = ">=3.11"
 authors = [{ name = "Pavan" }]
 keywords = ["single-cell", "deep-learning", "transformer", "scRNA-seq"]
