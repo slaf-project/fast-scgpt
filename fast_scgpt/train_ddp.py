@@ -12,6 +12,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 import modal
 import torch
@@ -27,7 +28,7 @@ from fast_scgpt.train import clip_expression_tokens, create_mask
 _IDX_DL, _IDX_MASK, _IDX_FWD, _IDX_BWD, _IDX_OPT, _IDX_COMPUTE, _IDX_TOTAL = range(7)
 
 
-def _stop_producer_workers(producer_loader: object) -> None:
+def _stop_producer_workers(producer_loader: object | None) -> None:
     """Stop Modal CPU producer workers so they don't keep running after training.
 
     Calls DistributedSLAFDataLoader.stop_prefetch_workers() (slaf stable API).
@@ -35,7 +36,7 @@ def _stop_producer_workers(producer_loader: object) -> None:
     if producer_loader is None:
         return
     try:
-        producer_loader.stop_prefetch_workers()
+        cast(Any, producer_loader).stop_prefetch_workers()
         logger.info("Producer loader.stop_prefetch_workers() completed")
     except Exception as e:
         logger.warning(
