@@ -6,6 +6,10 @@ Usage:
     # Run with defaults (500 steps)
     modal run modal_train.py
 
+    # A/B FlashAttention: flash-attn wheel (FA2/FA3) vs FlashAttention-4 (CuTe)
+    modal run modal_train.py --flash-attn-backend fa3
+    modal run modal_train.py --flash-attn-backend fa4
+
     # Custom configuration
     modal run modal_train.py --batch-size 64 --n-steps 1000
 
@@ -29,13 +33,12 @@ app = modal.App("fast-scgpt-benchmark")
 # Mount existing Modal volume with SLAF datasets
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
-# Build image with CUDA + dependencies
-# Flash Attention 3 on H100 uses native (B,T,H,D) layout - no transpose overhead
-image = (
+# Shared CUDA base (separate images: flash-attn wheel vs flash-attn-4 do not both install cleanly)
+_base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .uv_pip_install(
-        "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
+        "torch>=2.4.0,<2.5.0",
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",
@@ -47,75 +50,48 @@ image = (
         "ninja",
         "slafdb",
     )
-    # Flash Attention - FA3 on H100, FA2 on A100
-    .pip_install(
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
-    )
-    # Copy local fast_scgpt package
-    .add_local_dir("fast_scgpt", "/root/fast_scgpt")
 )
 
+image_fa3 = _base_image.pip_install(
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
+).add_local_dir("fast_scgpt", "/root/fast_scgpt")
 
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=7200,  # 2 hours max
-    volumes={"/data": slaf_volume},
-    secrets=[modal.Secret.from_name("s3-credentials")],
-)
-def train_on_modal(
-    batch_size: int = 32,
-    max_genes: int = 64,
-    n_steps: int = 500,
-    learning_rate: float = 1e-4,
-    log_every: int = 1,
-    model_size: str = "small",
-    gradient_accumulation_steps: int = 1,
-    use_gradient_checkpointing: bool = False,
-    use_compile: bool = False,
-    compile_mode: str = "reduce-overhead",
-    use_swiglu: bool = False,
-    use_lp_layernorm: bool = False,
-    use_softcap: bool = False,
-    use_strict_bf16: bool = False,
-    profile: bool = False,
-    data_source: str = "s3",
+image_fa4 = _base_image.uv_pip_install(
+    "flash-attn-4>=4.0.0b7,<5",
+).add_local_dir("fast_scgpt", "/root/fast_scgpt")
+
+
+def _train_on_modal_impl(
+    *,
+    flash_attn_backend: str,
+    batch_size: int,
+    max_genes: int,
+    n_steps: int,
+    learning_rate: float,
+    log_every: int,
+    model_size: str,
+    gradient_accumulation_steps: int,
+    use_gradient_checkpointing: bool,
+    use_compile: bool,
+    compile_mode: str,
+    use_swiglu: bool,
+    use_lp_layernorm: bool,
+    use_softcap: bool,
+    use_strict_bf16: bool,
+    profile: bool,
+    data_source: str,
 ) -> dict:
-    """Run training with GPU metrics on Modal.
-
-    Args:
-        batch_size: Batch size for training (micro-batch if using accumulation)
-        max_genes: Maximum genes per cell (affects seq_len)
-        n_steps: Number of training steps
-        learning_rate: Learning rate
-        log_every: Log interval
-        model_size: Model size preset (small/scgpt/base/large)
-            - small: 4L, 4H, 256D (dev/testing)
-            - scgpt: 12L, 4H, 512D, 1×FF (~51M params, matches original scGPT)
-            - base: 12L, 8H, 512D, 4×FF (~102M params, standard transformer)
-            - large: 24L, 16H, 1024D, 4×FF (scaling experiments)
-        gradient_accumulation_steps: Accumulate gradients over N micro-batches
-            Effective batch = batch_size * gradient_accumulation_steps
-        use_gradient_checkpointing: Trade compute for ~50% activation memory savings
-        use_compile: Use torch.compile for fused kernels (may speed up training)
-        compile_mode: "reduce-overhead" | "max-autotune" | "default" (for MFU try max-autotune)
-        use_swiglu: Use SwiGLU activation (Llama-style) instead of GELU
-        use_lp_layernorm: Force LayerNorm to stay in bf16 (Tahoe-X1 optimization)
-        use_softcap: Apply logit softcapping to prevent extreme logits (nanochat)
-        use_strict_bf16: Convert entire model to bf16 (more aggressive than autocast)
-        profile: Log timing breakdown (data/mask/forward/backward/optim)
-        data_source: Data source - "s3", "volume", or "hf" (HuggingFace)
-
-    Returns:
-        dict with training summary metrics
-    """
+    """Run training; ``flash_attn_backend`` is ``fa3`` or ``fa4`` (must match image)."""
+    import os
     import sys
 
+    os.environ["FAST_SCGPT_FLASH_ATTN_BACKEND"] = flash_attn_backend
     sys.path.insert(0, "/root")
 
     import torch
     from loguru import logger
 
+    from fast_scgpt.attention import attention_backend_label
     from fast_scgpt.config import ModelConfig
     from fast_scgpt.train import train
 
@@ -150,8 +126,6 @@ def train_on_modal(
     logger.info(f"SLAF path: {slaf_path}")
 
     # Verify S3 connectivity before creating dataloader
-    import os
-
     if slaf_path.startswith("s3://"):
         logger.info("Verifying S3 connectivity...")
         try:
@@ -246,6 +220,8 @@ def train_on_modal(
 
     result = {
         "status": "success",
+        "flash_attn_backend": flash_attn_backend,
+        "flash_attn_label": attention_backend_label(),
         "n_steps": n_steps,
         "batch_size": batch_size,
         "effective_batch_size": effective_batch,
@@ -293,6 +269,100 @@ def train_on_modal(
     return result
 
 
+@app.function(
+    image=image_fa3,
+    gpu="H100",
+    timeout=7200,
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+)
+def train_on_modal(
+    batch_size: int = 32,
+    max_genes: int = 64,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "small",
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_swiglu: bool = False,
+    use_lp_layernorm: bool = False,
+    use_softcap: bool = False,
+    use_strict_bf16: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """FlashAttention via the pinned ``flash-attn`` wheel (``FAST_SCGPT_FLASH_ATTN_BACKEND=fa3``)."""
+    return _train_on_modal_impl(
+        flash_attn_backend="fa3",
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        model_size=model_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_swiglu=use_swiglu,
+        use_lp_layernorm=use_lp_layernorm,
+        use_softcap=use_softcap,
+        use_strict_bf16=use_strict_bf16,
+        profile=profile,
+        data_source=data_source,
+    )
+
+
+@app.function(
+    image=image_fa4,
+    gpu="H100",
+    timeout=7200,
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+)
+def train_on_modal_fa4(
+    batch_size: int = 32,
+    max_genes: int = 64,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    model_size: str = "small",
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_swiglu: bool = False,
+    use_lp_layernorm: bool = False,
+    use_softcap: bool = False,
+    use_strict_bf16: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """FlashAttention-4 (``pip install flash-attn-4``; ``FAST_SCGPT_FLASH_ATTN_BACKEND=fa4``)."""
+    return _train_on_modal_impl(
+        flash_attn_backend="fa4",
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        model_size=model_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_swiglu=use_swiglu,
+        use_lp_layernorm=use_lp_layernorm,
+        use_softcap=use_softcap,
+        use_strict_bf16=use_strict_bf16,
+        profile=profile,
+        data_source=data_source,
+    )
+
+
 @app.local_entrypoint()
 def main(
     batch_size: int = 32,
@@ -311,6 +381,7 @@ def main(
     use_strict_bf16: bool = False,
     profile: bool = False,
     data_source: str = "s3",
+    flash_attn_backend: str = "fa3",
 ) -> None:
     """Run training benchmark from local machine.
 
@@ -330,7 +401,12 @@ def main(
         use_softcap: Apply logit softcapping (nanochat)
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
+        flash_attn_backend: "fa3" (flash-attn wheel) or "fa4" (flash-attn-4 image)
     """
+    if flash_attn_backend not in ("fa3", "fa4"):
+        raise ValueError("flash_attn_backend must be 'fa3' or 'fa4'")
+    train_fn = train_on_modal_fa4 if flash_attn_backend == "fa4" else train_on_modal
+
     effective_batch = batch_size * gradient_accumulation_steps
     print("Launching fast-scGPT training on Modal GPU...")
     print(f"  batch_size={batch_size}, max_genes={max_genes}, n_steps={n_steps}")
@@ -346,9 +422,10 @@ def main(
     print(f"  use_strict_bf16={use_strict_bf16}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
+    print(f"  flash_attn_backend={flash_attn_backend}")
     print()
 
-    result = train_on_modal.remote(
+    result = train_fn.remote(
         batch_size=batch_size,
         max_genes=max_genes,
         n_steps=n_steps,
@@ -374,6 +451,8 @@ def main(
 
     if result.get("status") == "success":
         print("Status: SUCCESS")
+        if result.get("flash_attn_label"):
+            print(f"Flash attention: {result['flash_attn_label']}")
         print(f"Steps completed: {result['n_steps']}")
         print(f"Batch size: {result['batch_size']}")
         if result.get("effective_batch_size"):
