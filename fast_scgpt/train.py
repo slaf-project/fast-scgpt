@@ -23,6 +23,7 @@ from loguru import logger
 
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.device import get_device, get_device_info, get_dtype
+from fast_scgpt.gpu_hw_metrics import DmonUtilSampler
 from fast_scgpt.model import ScGPT
 
 
@@ -37,6 +38,9 @@ class GPUMetrics:
     memory_allocated_gb: float = 0.0
     memory_reserved_gb: float = 0.0
     memory_utilization_pct: float = 0.0
+    # nvidia-smi dmon (steady state, after first training step)
+    gpu_utilization_pct: float | None = None
+    sm_efficiency_pct: float | None = None
 
     # Cumulative tracking
     _step_times: list[float] = field(default_factory=list)
@@ -85,7 +89,7 @@ class GPUMetrics:
         avg_step_time = sum(times) / len(times) if times else 0
         median_step_time = sorted(times)[len(times) // 2] if times else 0
 
-        return {
+        out: dict[str, float] = {
             "avg_step_time_ms": avg_step_time,
             "median_step_time_ms": median_step_time,
             "total_cells": self._cells_processed,
@@ -93,6 +97,11 @@ class GPUMetrics:
             "peak_memory_gb": self.peak_memory_gb,
             "memory_utilization_pct": self.memory_utilization_pct,
         }
+        if self.gpu_utilization_pct is not None:
+            out["gpu_utilization_pct"] = round(self.gpu_utilization_pct, 1)
+        if self.sm_efficiency_pct is not None:
+            out["sm_efficiency_pct"] = round(self.sm_efficiency_pct, 1)
+        return out
 
 
 def reset_cuda_stats(device: torch.device) -> None:
@@ -485,6 +494,7 @@ def train(
         lr=learning_rate,
         weight_decay=0.1,
         betas=(0.9, 0.95),
+        fused=True,
     )
 
     # Mixed precision training (CUDA only; disabled when strict bf16 owns dtypes)
@@ -514,6 +524,8 @@ def train(
     # Initialize GPU metrics tracking
     metrics = GPUMetrics()
     reset_cuda_stats(device)
+    hw_sampler: DmonUtilSampler | None = None
+    n_cuda_devices = torch.cuda.device_count() if device.type == "cuda" else 0
 
     # Training loop
     effective_batch_size = batch_size * gradient_accumulation_steps
@@ -761,6 +773,22 @@ def train(
             accum_step_ms = 0.0
 
             step += 1
+            if (
+                device.type == "cuda"
+                and n_cuda_devices > 0
+                and step == 1
+                and hw_sampler is None
+            ):
+                hw_sampler = DmonUtilSampler(n_gpus=n_cuda_devices)
+                if not hw_sampler.start():
+                    hw_sampler = None
+
+    if hw_sampler is not None:
+        g_pct, sm_pct = hw_sampler.stop()
+        if g_pct is not None:
+            metrics.gpu_utilization_pct = g_pct
+        if sm_pct is not None:
+            metrics.sm_efficiency_pct = sm_pct
 
     elapsed = time.time() - start_time
     training_time_sec = sum(metrics._step_times) / 1000  # Convert ms to sec
@@ -788,6 +816,16 @@ def train(
             summary["peak_memory_gb"],
             summary["memory_utilization_pct"],
         )
+        if metrics.gpu_utilization_pct is not None:
+            logger.info(
+                "  GPU utilization (nvidia-smi): {:.1f}%",
+                metrics.gpu_utilization_pct,
+            )
+        if metrics.sm_efficiency_pct is not None:
+            logger.info(
+                "  SM efficiency (nvidia-smi dmon sm): {:.1f}%",
+                metrics.sm_efficiency_pct,
+            )
 
     if first_loss is not None and last_loss is not None:
         loss_change = "↓" if last_loss < first_loss else "↑"

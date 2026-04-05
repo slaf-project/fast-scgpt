@@ -95,6 +95,9 @@ checkpoints/
 logs/
 wandb/
 
+# Local copy of Modal volume benchmarks (modal volume get slaf-datasets benchmark_results …)
+benchmark_results/
+
 # UV
 uv.lock
 

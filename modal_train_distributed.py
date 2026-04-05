@@ -13,6 +13,9 @@ Usage:
     # Single node (8x H100)
     modal run modal_train_distributed.py
 
+    # FlashAttention-4 A/B (uses separate Modal image with flash-attn-4)
+    modal run modal_train_distributed.py --flash-attn-backend fa4
+
     # Multi-node (2 nodes = 16x H100, default for --multinode)
     modal run modal_train_distributed.py --multinode
 
@@ -44,9 +47,8 @@ app = modal.App("fast-scgpt-distributed")
 # Mount existing Modal volume with SLAF datasets
 slaf_volume = modal.Volume.from_name("slaf-datasets")
 
-# Build image with CUDA + dependencies; slafdb for queue-based distributed dataloader
-# libhwloc15, libnl-route-3-200 (and ibverbs) needed for efa_enabled on multi-node
-image = (
+# Build images; libhwloc15, libnl-route-3-200 (and ibverbs) for efa_enabled on multi-node
+_distributed_base = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
         "git",
@@ -56,7 +58,7 @@ image = (
         "libnl-route-3-200",
     )
     .uv_pip_install(
-        "torch>=2.4.0,<2.5.0",  # Pin for flash-attn compatibility
+        "torch>=2.4.0,<2.5.0",
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",
@@ -69,17 +71,20 @@ image = (
         "modal",
         "slafdb",
     )
-    # Flash Attention - FA3 on H100
-    .uv_pip_install(
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
-    )
-    # Copy local fast_scgpt package
-    .add_local_dir("fast_scgpt", "/root/fast_scgpt")
 )
+
+image_fa3 = _distributed_base.pip_install(
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
+).add_local_dir("fast_scgpt", "/root/fast_scgpt")
+
+image_fa4 = _distributed_base.uv_pip_install(
+    "flash-attn-4>=4.0.0b7,<5",
+).add_local_dir("fast_scgpt", "/root/fast_scgpt")
 
 
 def _run_training(
     *,
+    flash_attn_backend: str,
     batch_size: int,
     max_genes: int,
     n_steps: int,
@@ -103,6 +108,7 @@ def _run_training(
     import sys
     import time
 
+    os.environ["FAST_SCGPT_FLASH_ATTN_BACKEND"] = flash_attn_backend
     sys.path.insert(0, "/root")
 
     import torch
@@ -276,6 +282,7 @@ def _run_training(
         effective_batch = batch_size * gradient_accumulation_steps * num_gpus_total
         summary = {
             "status": "success",
+            "flash_attn_backend": flash_attn_backend,
             "n_steps": n_steps,
             "batch_size_per_gpu": batch_size,
             "effective_batch_size": effective_batch,
@@ -286,6 +293,12 @@ def _run_training(
             "elapsed_sec": elapsed,
             "gpu_name": torch.cuda.get_device_name(0),
         }
+        try:
+            from fast_scgpt.attention import attention_backend_label
+
+            summary["flash_attn_label"] = attention_backend_label()
+        except Exception:
+            pass
         # Merge peak memory from train_ddp (rank 0 writes to metrics file)
         try:
             with open(metrics_file_path) as f:
@@ -345,7 +358,7 @@ def _run_training(
 
 
 @app.function(
-    image=image,
+    image=image_fa3,
     gpu="A100:2",
     timeout=14400,  # 4 hours max
     volumes={"/data": slaf_volume},
@@ -364,8 +377,9 @@ def train_distributed_on_modal(
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
-    """Run distributed training on 8x H100 Modal (single node)."""
+    """Run distributed training on 8x H100 (single node); flash-attn wheel (FA2/FA3)."""
     return _run_training(
+        flash_attn_backend="fa3",
         batch_size=batch_size,
         max_genes=max_genes,
         n_steps=n_steps,
@@ -382,7 +396,45 @@ def train_distributed_on_modal(
 
 
 @app.function(
-    image=image,
+    image=image_fa4,
+    gpu="A100:2",
+    timeout=14400,
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+)
+def train_distributed_on_modal_fa4(
+    batch_size: int = 64,
+    max_genes: int = 1024,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
+    model_size: str = "base",
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """Run distributed training on 8x H100 (single node); FlashAttention-4."""
+    return _run_training(
+        flash_attn_backend="fa4",
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        model_size=model_size,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        profile=profile,
+        data_source=data_source,
+        cluster_info=None,
+    )
+
+
+@app.function(
+    image=image_fa3,
     gpu="H100:8",
     timeout=14400,
     volumes={"/data": slaf_volume},
@@ -407,6 +459,48 @@ def train_distributed_multinode_on_modal(
     """Run distributed training on 2 nodes x 8x H100 (16 GPUs). Multi-node (Beta)."""
     cluster_info = modal.experimental.get_cluster_info()
     return _run_training(
+        flash_attn_backend="fa3",
+        batch_size=batch_size,
+        max_genes=max_genes,
+        n_steps=n_steps,
+        learning_rate=learning_rate,
+        log_every=log_every,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        model_size=model_size,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        use_compile=use_compile,
+        profile=profile,
+        data_source=data_source,
+        cluster_info=cluster_info,
+    )
+
+
+@app.function(
+    image=image_fa4,
+    gpu="H100:8",
+    timeout=14400,
+    volumes={"/data": slaf_volume},
+    secrets=[modal.Secret.from_name("s3-credentials")],
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=2, rdma=True)
+def train_distributed_multinode_on_modal_fa4(
+    batch_size: int = 64,
+    max_genes: int = 1024,
+    n_steps: int = 500,
+    learning_rate: float = 1e-4,
+    log_every: int = 1,
+    gradient_accumulation_steps: int = 1,
+    model_size: str = "base",
+    use_gradient_checkpointing: bool = False,
+    use_compile: bool = False,
+    profile: bool = False,
+    data_source: str = "s3",
+) -> dict:
+    """Multi-node 16x H100 with FlashAttention-4."""
+    cluster_info = modal.experimental.get_cluster_info()
+    return _run_training(
+        flash_attn_backend="fa4",
         batch_size=batch_size,
         max_genes=max_genes,
         n_steps=n_steps,
@@ -436,6 +530,7 @@ def main(
     profile: bool = False,
     data_source: str = "s3",
     multinode: bool = False,
+    flash_attn_backend: str = "fa3",
 ) -> None:
     """Run distributed training benchmark from local machine.
 
@@ -456,14 +551,26 @@ def main(
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
         multinode: If True, run on 2 nodes (16x H100). Default False = single node (8x H100).
+        flash_attn_backend: "fa3" (flash-attn wheel) or "fa4" (flash-attn-4)
     """
+    if flash_attn_backend not in ("fa3", "fa4"):
+        raise ValueError("flash_attn_backend must be 'fa3' or 'fa4'")
+
     if multinode:
         num_gpus = 16  # 2 nodes x 8
-        train_fn = train_distributed_multinode_on_modal
+        train_fn = (
+            train_distributed_multinode_on_modal_fa4
+            if flash_attn_backend == "fa4"
+            else train_distributed_multinode_on_modal
+        )
         mode = "2 nodes (16x H100)"
     else:
         num_gpus = 8
-        train_fn = train_distributed_on_modal
+        train_fn = (
+            train_distributed_on_modal_fa4
+            if flash_attn_backend == "fa4"
+            else train_distributed_on_modal
+        )
         mode = "8x H100"
     effective_batch = batch_size * gradient_accumulation_steps * num_gpus
 
@@ -491,6 +598,7 @@ def main(
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print(f"  multinode={multinode}")
+    print(f"  flash_attn_backend={flash_attn_backend}")
     print()
 
     result = train_fn.remote(
@@ -529,6 +637,10 @@ def main(
             print(f"Training time (compute): {result['training_elapsed_sec']:.1f}s")
         if "mfu_pct" in result:
             print(f"MFU: {result['mfu_pct']}%")
+        if "gpu_utilization_pct" in result:
+            print(f"GPU utilization (nvidia-smi): {result['gpu_utilization_pct']}%")
+        if "sm_efficiency_pct" in result:
+            print(f"SM efficiency (dmon): {result['sm_efficiency_pct']}%")
         if "achieved_tflops_total" in result:
             print(f"Achieved TFLOPS (total): {result['achieved_tflops_total']}")
         if "achieved_tflops_per_gpu" in result:

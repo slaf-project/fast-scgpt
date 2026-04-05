@@ -58,7 +58,8 @@ def compute_training_metrics(summary: dict) -> dict:
       - max_genes, model_size, gpu_name
 
     Optionally from train_ddp metrics file: peak_memory_gb, memory_utilization_pct,
-    training_elapsed_sec. When training_elapsed_sec is present we use it for MFU,
+    gpu_utilization_pct, sm_efficiency_pct (nvidia-smi / dmon), training_elapsed_sec.
+    When training_elapsed_sec is present we use it for MFU,
     throughput and steps_per_sec (so numbers match train_ddp's log); otherwise we use
     elapsed_sec (total run time including startup).
     """
@@ -107,4 +108,8 @@ def compute_training_metrics(summary: dict) -> dict:
         out["peak_memory_gb"] = summary["peak_memory_gb"]
     if "memory_utilization_pct" in summary:
         out["memory_utilization_pct"] = summary["memory_utilization_pct"]
+    if "gpu_utilization_pct" in summary:
+        out["gpu_utilization_pct"] = summary["gpu_utilization_pct"]
+    if "sm_efficiency_pct" in summary:
+        out["sm_efficiency_pct"] = summary["sm_efficiency_pct"]
     return out

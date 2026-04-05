@@ -21,6 +21,7 @@ from loguru import logger
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from fast_scgpt.config import ModelConfig
+from fast_scgpt.gpu_hw_metrics import DmonUtilSampler
 from fast_scgpt.model import ScGPT
 from fast_scgpt.train import clip_expression_tokens, create_mask
 
@@ -166,6 +167,7 @@ def train_ddp(
     # Setup distributed
     rank, world_size, device = setup_distributed()
     is_main = rank == 0
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     if config is None:
         config = ModelConfig.small()
@@ -285,7 +287,11 @@ def train_ddp(
 
     # Optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=0.1, betas=(0.9, 0.95)
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=0.1,
+        betas=(0.9, 0.95),
+        fused=True,
     )
 
     # All ranks: attach to same queue and create consumer dataloader
@@ -331,6 +337,9 @@ def train_ddp(
     accum_optim_ms = 0.0
 
     optimizer.zero_grad()
+
+    hw_sampler: DmonUtilSampler | None = None
+    n_cuda_local = torch.cuda.device_count() if device.type == "cuda" else 0
 
     while step < n_steps:
         t_dl_start = time.perf_counter()
@@ -452,6 +461,16 @@ def train_ddp(
             step += 1
             micro_step = 0
             accum_step_ms = 0.0
+            if (
+                device.type == "cuda"
+                and local_rank == 0
+                and n_cuda_local > 0
+                and step == 1
+                and hw_sampler is None
+            ):
+                hw_sampler = DmonUtilSampler(n_gpus=n_cuda_local)
+                if not hw_sampler.start():
+                    hw_sampler = None
 
         if is_main and is_accumulation_boundary and step % log_every == 0:
             avg_loss = total_loss / (log_every * gradient_accumulation_steps)
@@ -489,6 +508,30 @@ def train_ddp(
     elapsed = time.time() - start_time
     summary = metrics.summary()
 
+    g_hw: float | None = None
+    sm_hw: float | None = None
+    if device.type == "cuda" and local_rank == 0 and hw_sampler is not None:
+        g_hw, sm_hw = hw_sampler.stop()
+
+    sum_g = torch.tensor(
+        [float(g_hw) if g_hw is not None else 0.0], dtype=torch.float32, device=device
+    )
+    cnt_g = torch.tensor(
+        [1.0 if g_hw is not None else 0.0], dtype=torch.float32, device=device
+    )
+    sum_s = torch.tensor(
+        [float(sm_hw) if sm_hw is not None else 0.0], dtype=torch.float32, device=device
+    )
+    cnt_s = torch.tensor(
+        [1.0 if sm_hw is not None else 0.0], dtype=torch.float32, device=device
+    )
+    dist.all_reduce(sum_g, op=dist.ReduceOp.SUM)
+    dist.all_reduce(cnt_g, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_s, op=dist.ReduceOp.SUM)
+    dist.all_reduce(cnt_s, op=dist.ReduceOp.SUM)
+    avg_g = sum_g.item() / cnt_g.item() if cnt_g.item() > 0 else None
+    avg_s = sum_s.item() / cnt_s.item() if cnt_s.item() > 0 else None
+
     # All-reduce peak memory so we report max across ranks; rank 0 writes metrics for Modal
     peak_gb_tensor = torch.tensor(
         [summary["peak_memory_gb"]], dtype=torch.float32, device=device
@@ -505,6 +548,10 @@ def train_ddp(
         "memory_utilization_pct": round(util_pct_tensor.item(), 1),
         "training_elapsed_sec": round(training_elapsed_sec, 2),
     }
+    if avg_g is not None:
+        metrics_for_modal["gpu_utilization_pct"] = round(avg_g, 1)
+    if avg_s is not None:
+        metrics_for_modal["sm_efficiency_pct"] = round(avg_s, 1)
     metrics_file = os.environ.get("FAST_SCGPT_METRICS_FILE")
     if is_main and metrics_file:
         with open(metrics_file, "w") as f:
