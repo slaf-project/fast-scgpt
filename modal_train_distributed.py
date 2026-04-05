@@ -529,6 +529,10 @@ def main(
             print(f"Training time (compute): {result['training_elapsed_sec']:.1f}s")
         if "mfu_pct" in result:
             print(f"MFU: {result['mfu_pct']}%")
+        if "gpu_utilization_pct" in result:
+            print(f"GPU utilization (nvidia-smi): {result['gpu_utilization_pct']}%")
+        if "sm_efficiency_pct" in result:
+            print(f"SM efficiency (dmon): {result['sm_efficiency_pct']}%")
         if "achieved_tflops_total" in result:
             print(f"Achieved TFLOPS (total): {result['achieved_tflops_total']}")
         if "achieved_tflops_per_gpu" in result:

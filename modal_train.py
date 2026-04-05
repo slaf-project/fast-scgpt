@@ -265,6 +265,10 @@ def train_on_modal(
         "memory_utilization_pct": summary["memory_utilization_pct"],
         "gpu_name": torch.cuda.get_device_name(0),
     }
+    if "gpu_utilization_pct" in summary:
+        result["gpu_utilization_pct"] = summary["gpu_utilization_pct"]
+    if "sm_efficiency_pct" in summary:
+        result["sm_efficiency_pct"] = summary["sm_efficiency_pct"]
 
     # MFU, achieved TFLOPS, throughput, steps/sec (comparable to distributed benchmarks)
     from fast_scgpt.training_metrics import compute_training_metrics
@@ -383,6 +387,10 @@ def main(
             print(f"Training time (compute): {result['training_elapsed_sec']:.1f}s")
         if "mfu_pct" in result:
             print(f"MFU: {result['mfu_pct']}%")
+        if "gpu_utilization_pct" in result:
+            print(f"GPU utilization (nvidia-smi): {result['gpu_utilization_pct']}%")
+        if "sm_efficiency_pct" in result:
+            print(f"SM efficiency (dmon): {result['sm_efficiency_pct']}%")
         if "achieved_tflops_total" in result:
             print(f"Achieved TFLOPS (total): {result['achieved_tflops_total']}")
         if "achieved_tflops_per_gpu" in result:
