@@ -494,6 +494,7 @@ def train(
         lr=learning_rate,
         weight_decay=0.1,
         betas=(0.9, 0.95),
+        fused=True,
     )
 
     # Mixed precision training (CUDA only; disabled when strict bf16 owns dtypes)

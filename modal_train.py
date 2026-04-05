@@ -186,7 +186,7 @@ def _train_on_modal_impl(
     logger.info("=" * 60)
 
     # Enable sync CUDA errors for better debugging
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # Memory optimization: expandable segments reduces fragmentation
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"

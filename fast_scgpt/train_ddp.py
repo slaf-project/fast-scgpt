@@ -287,7 +287,11 @@ def train_ddp(
 
     # Optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=0.1, betas=(0.9, 0.95)
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=0.1,
+        betas=(0.9, 0.95),
+        fused=True,
     )
 
     # All ranks: attach to same queue and create consumer dataloader
