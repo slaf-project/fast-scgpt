@@ -25,6 +25,9 @@ Usage:
     # Test with minimal config
     modal run modal_train_distributed.py --batch-size 8 --max-genes 128 --n-steps 50
 
+    # Sparse gene head (masked positions only; PRD 013 approach 2)
+    modal run modal_train_distributed.py --sparse-gene-head --n-steps 100
+
     # Run in detached mode
     modal run --detach modal_train_distributed.py --n-steps 1000
 
@@ -94,6 +97,7 @@ def _run_training(
     model_size: str,
     use_gradient_checkpointing: bool,
     use_compile: bool,
+    sparse_gene_head: bool,
     profile: bool,
     data_source: str,
     cluster_info: Any = None,
@@ -119,7 +123,7 @@ def _run_training(
         num_nodes = len(cluster_info.container_ips)
         node_rank = cluster_info.rank
         master_addr = cluster_info.container_ips[0]
-        num_gpus_total = 8 * num_nodes
+        num_gpus_total = torch.cuda.device_count() * num_nodes
         logger.info(
             f"Multi-node: node_rank={node_rank} nnodes={num_nodes} master_addr={master_addr}"
         )
@@ -263,8 +267,15 @@ def _run_training(
         cmd.append("--use_gradient_checkpointing")
     if use_compile:
         cmd.append("--use_compile")
+    if sparse_gene_head:
+        cmd.append("--sparse-gene-head")
     if profile:
         cmd.append("--profile")
+
+    if sparse_gene_head:
+        logger.info(
+            "Sparse gene head enabled (gene projection at masked positions only)"
+        )
 
     logger.info("Launching distributed training with command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -283,6 +294,7 @@ def _run_training(
         summary = {
             "status": "success",
             "flash_attn_backend": flash_attn_backend,
+            "sparse_gene_head": sparse_gene_head,
             "n_steps": n_steps,
             "batch_size_per_gpu": batch_size,
             "effective_batch_size": effective_batch,
@@ -359,7 +371,7 @@ def _run_training(
 
 @app.function(
     image=image_fa3,
-    gpu="A100:2",
+    gpu="H100:8",
     timeout=14400,  # 4 hours max
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -374,10 +386,11 @@ def train_distributed_on_modal(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
-    """Run distributed training on 8x H100 (single node); flash-attn wheel (FA2/FA3)."""
+    """Single-node 8x H100; flash-attn wheel (FA2/FA3)."""
     return _run_training(
         flash_attn_backend="fa3",
         batch_size=batch_size,
@@ -389,6 +402,7 @@ def train_distributed_on_modal(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
         cluster_info=None,
@@ -397,7 +411,7 @@ def train_distributed_on_modal(
 
 @app.function(
     image=image_fa4,
-    gpu="A100:2",
+    gpu="H100:8",
     timeout=14400,
     volumes={"/data": slaf_volume},
     secrets=[modal.Secret.from_name("s3-credentials")],
@@ -412,10 +426,11 @@ def train_distributed_on_modal_fa4(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
-    """Run distributed training on 8x H100 (single node); FlashAttention-4."""
+    """Single-node 8x H100; FlashAttention-4."""
     return _run_training(
         flash_attn_backend="fa4",
         batch_size=batch_size,
@@ -427,6 +442,7 @@ def train_distributed_on_modal_fa4(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
         cluster_info=None,
@@ -453,6 +469,7 @@ def train_distributed_multinode_on_modal(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
@@ -469,6 +486,7 @@ def train_distributed_multinode_on_modal(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
         cluster_info=cluster_info,
@@ -494,6 +512,7 @@ def train_distributed_multinode_on_modal_fa4(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
 ) -> dict:
@@ -510,6 +529,7 @@ def train_distributed_multinode_on_modal_fa4(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
         cluster_info=cluster_info,
@@ -527,6 +547,7 @@ def main(
     model_size: str = "base",
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
     multinode: bool = False,
@@ -545,9 +566,10 @@ def main(
         learning_rate: LR (default: 1e-4)
         log_every: Log interval (default: 1)
         gradient_accumulation_steps: Accumulate gradients over N micro-steps (default: 1)
-        model_size: small/base/large (default: base)
+        model_size: small/scgpt/base/large (default: base)
         use_gradient_checkpointing: Trade compute for memory
         use_compile: Use torch.compile for fused kernels
+        sparse_gene_head: Gene LM head only at masked positions
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
         multinode: If True, run on 2 nodes (16x H100). Default False = single node (8x H100).
@@ -595,6 +617,7 @@ def main(
     print(f"  gradient_accumulation_steps={gradient_accumulation_steps}")
     print(f"  use_gradient_checkpointing={use_gradient_checkpointing}")
     print(f"  use_compile={use_compile}")
+    print(f"  sparse_gene_head={sparse_gene_head}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print(f"  multinode={multinode}")
@@ -611,6 +634,7 @@ def main(
         model_size=model_size,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_compile=use_compile,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
     )

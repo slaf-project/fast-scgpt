@@ -14,17 +14,26 @@ import argparse
 import itertools
 import sys
 import time
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from loguru import logger
+from torch.autograd.profiler import record_function
 
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.device import get_device, get_device_info, get_dtype
 from fast_scgpt.gpu_hw_metrics import DmonUtilSampler
 from fast_scgpt.model import ScGPT
+from fast_scgpt.training_profiler import (
+    build_torch_profiler,
+    export_chrome_trace,
+    format_profiler_report,
+    set_torch_profiler_active,
+    torch_profiler_active,
+)
 
 
 @dataclass
@@ -46,6 +55,7 @@ class GPUMetrics:
     _step_times: list[float] = field(default_factory=list)
     _cells_processed: int = 0
     _tokens_processed: int = 0
+    _cells_per_optimizer_step: int = 0
 
     def update(
         self,
@@ -54,9 +64,14 @@ class GPUMetrics:
         seq_len: int,
         device: torch.device,
     ) -> None:
-        """Update metrics after a training step."""
+        """Update metrics after a training step.
+
+        ``batch_size`` is the number of training examples (cells) per optimizer step
+        (``batch_size * gradient_accumulation_steps`` from the training loop).
+        """
         self.step_time_ms = step_time_ms
         self._step_times.append(step_time_ms)
+        self._cells_per_optimizer_step = batch_size
 
         # Throughput metrics
         step_time_sec = step_time_ms / 1000.0
@@ -81,19 +96,28 @@ class GPUMetrics:
     def summary(self) -> dict[str, float]:
         """Return summary statistics.
 
-        Excludes first batch (warmup) and reports median for robustness.
+        Avg/median step times exclude the first optimizer step when there are
+        multiple steps (compile / cache warmup). ``median_cells_per_sec`` uses
+        that median duration (comparable to typical per-step logs).
         """
-        # Exclude first batch (warmup/compilation)
+        # Exclude first batch (warmup/compilation) for robust step-time stats
         times = self._step_times[1:] if len(self._step_times) > 1 else self._step_times
 
         avg_step_time = sum(times) / len(times) if times else 0
         median_step_time = sorted(times)[len(times) // 2] if times else 0
+
+        median_cells_per_sec = (
+            self._cells_per_optimizer_step / (median_step_time / 1000.0)
+            if median_step_time > 0 and self._cells_per_optimizer_step > 0
+            else 0.0
+        )
 
         out: dict[str, float] = {
             "avg_step_time_ms": avg_step_time,
             "median_step_time_ms": median_step_time,
             "total_cells": self._cells_processed,
             "total_tokens": self._tokens_processed,
+            "median_cells_per_sec": median_cells_per_sec,
             "peak_memory_gb": self.peak_memory_gb,
             "memory_utilization_pct": self.memory_utilization_pct,
         }
@@ -235,6 +259,13 @@ def clip_expression_tokens(
     return clipped
 
 
+def _torch_prof_region(name: str) -> AbstractContextManager[Any]:
+    return cast(
+        AbstractContextManager[Any],
+        record_function(name) if torch_profiler_active() else nullcontext(),
+    )
+
+
 def train_step(
     model: ScGPT,
     batch: dict[str, torch.Tensor],
@@ -271,29 +302,31 @@ def train_step(
         torch.cuda.synchronize(device)
         t_start = time.perf_counter()
 
-    # Move batch to device
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
+    with _torch_prof_region("scgpt.data"):
+        # Move batch to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
-    # Clip expression tokens to valid range (workaround for SLAF tokenizer bug)
-    input_ids = clip_expression_tokens(
-        input_ids, config.vocab_size, config.n_expression_bins
-    )
+        # Clip expression tokens to valid range (workaround for SLAF tokenizer bug)
+        input_ids = clip_expression_tokens(
+            input_ids, config.vocab_size, config.n_expression_bins
+        )
 
     if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
         t_data = time.perf_counter()
 
-    # Create masking
-    masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
-        input_ids,
-        attention_mask,
-        mask_token_id=config.mask_token_id,
-        gene_token_offset=config.gene_token_offset,
-        vocab_size=config.vocab_size,
-        expr_token_offset=config.expr_token_offset,
-        mask_ratio=0.15,
-    )
+    with _torch_prof_region("scgpt.mask"):
+        # Create masking
+        masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
+            input_ids,
+            attention_mask,
+            mask_token_id=config.mask_token_id,
+            gene_token_offset=config.gene_token_offset,
+            vocab_size=config.vocab_size,
+            expr_token_offset=config.expr_token_offset,
+            mask_ratio=0.15,
+        )
 
     if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -307,16 +340,19 @@ def train_step(
     )
     use_autocast = use_amp and device.type == "cuda"
 
-    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
-        loss_dict = model.compute_loss(
-            masked_input_ids,
-            attention_mask,
-            gene_targets,
-            expr_targets,
-            gene_mask,
-        )
-        # Scale loss for gradient accumulation
-        loss = loss_dict["loss"] / gradient_accumulation_steps
+    with _torch_prof_region("scgpt.forward_loss"):
+        with torch.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=use_autocast
+        ):
+            loss_dict = model.compute_loss(
+                masked_input_ids,
+                attention_mask,
+                gene_targets,
+                expr_targets,
+                gene_mask,
+            )
+            # Scale loss for gradient accumulation
+            loss = loss_dict["loss"] / gradient_accumulation_steps
 
     if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -324,14 +360,16 @@ def train_step(
 
     # Backward pass with gradient scaling
     if scaler is not None and use_autocast:
-        scaler.scale(loss).backward()
+        with _torch_prof_region("scgpt.backward"):
+            scaler.scale(loss).backward()
         if is_accumulation_boundary:
             if profile and device.type == "cuda":
                 torch.cuda.synchronize(device)
                 t_backward = time.perf_counter()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+            with _torch_prof_region("scgpt.optimizer"):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             if profile and device.type == "cuda":
                 torch.cuda.synchronize(device)
                 t_optim = time.perf_counter()
@@ -341,13 +379,15 @@ def train_step(
                 t_backward = time.perf_counter()
                 t_optim = t_backward  # No optimizer step
     else:
-        loss.backward()
+        with _torch_prof_region("scgpt.backward"):
+            loss.backward()
         if is_accumulation_boundary:
             if profile and device.type == "cuda":
                 torch.cuda.synchronize(device)
                 t_backward = time.perf_counter()
-            optimizer.step()
-            optimizer.zero_grad()
+            with _torch_prof_region("scgpt.optimizer"):
+                optimizer.step()
+                optimizer.zero_grad()
             if profile and device.type == "cuda":
                 torch.cuda.synchronize(device)
                 t_optim = time.perf_counter()
@@ -385,6 +425,11 @@ def train(
     compile_mode: str = "reduce-overhead",
     profile: bool = False,
     use_strict_bf16: bool = False,
+    torch_profiler_steps: int = 0,
+    torch_profiler_warmup_steps: int = 2,
+    torch_profiler_chrome_path: str | None = None,
+    torch_profiler_record_shapes: bool = False,
+    torch_profiler_with_stack: bool = False,
 ) -> GPUMetrics:
     """Train ScGPT on SLAF data.
 
@@ -406,6 +451,16 @@ def train(
             "max-autotune" (slower compile, often better MFU at large batch), or "default"
         profile: Log timing breakdown (data/mask/forward/backward/optim)
         use_strict_bf16: Keep weights/compute in bf16 without autocast (CUDA bf16 only)
+        torch_profiler_steps: If > 0 (CUDA only), run PyTorch profiler for this many
+            optimizer steps after ``torch_profiler_warmup_steps``, then log a CUDA/CPU
+            summary (and optional Chrome trace). Adds ``scgpt.*`` regions for step
+            and submodule breakdown. May graph-break ``torch.compile``; compare with
+            compile off for clearer operator names.
+        torch_profiler_warmup_steps: Optimizer steps to run before starting capture
+            (skip compile / first-batch overhead).
+        torch_profiler_chrome_path: If set, write ``export_chrome_trace`` JSON here.
+        torch_profiler_record_shapes: Pass through to ``torch.profiler.profile``.
+        torch_profiler_with_stack: Pass through to ``torch.profiler.profile`` (heavy).
 
     Returns:
         GPUMetrics with training statistics
@@ -612,7 +667,38 @@ def train(
     batch_iter = iter(batches)
     dataloader_time_ms = 0.0  # Track time waiting for dataloader
 
+    profiler_ctx: Any = None
+    if torch_profiler_steps > 0 and device.type == "cuda":
+        need = torch_profiler_warmup_steps + torch_profiler_steps
+        if n_steps < need:
+            logger.warning(
+                "torch_profiler_steps={} with warmup={} needs at least {} optimizer steps; "
+                "n_steps={} — profiler may capture fewer steps or end early",
+                torch_profiler_steps,
+                torch_profiler_warmup_steps,
+                need,
+                n_steps,
+            )
+
     while step < n_steps:
+        if (
+            torch_profiler_steps > 0
+            and device.type == "cuda"
+            and profiler_ctx is None
+            and step == torch_profiler_warmup_steps
+        ):
+            profiler_ctx = build_torch_profiler(
+                record_shapes=torch_profiler_record_shapes,
+                with_stack=torch_profiler_with_stack,
+            )
+            profiler_ctx.__enter__()
+            set_torch_profiler_active(True)
+            logger.info(
+                "Torch profiler: capturing {} optimizer steps (after {} warmup steps)",
+                torch_profiler_steps,
+                torch_profiler_warmup_steps,
+            )
+
         # Measure dataloader wait time
         dl_start = time.perf_counter()
         try:
@@ -774,6 +860,23 @@ def train(
 
             step += 1
             if (
+                profiler_ctx is not None
+                and step == torch_profiler_warmup_steps + torch_profiler_steps
+            ):
+                set_torch_profiler_active(False)
+                profiler_ctx.__exit__(None, None, None)
+                logger.info(
+                    "Torch profiler summary:\n{}", format_profiler_report(profiler_ctx)
+                )
+                if torch_profiler_chrome_path:
+                    export_chrome_trace(profiler_ctx, torch_profiler_chrome_path)
+                    logger.info(
+                        "Torch profiler Chrome trace: {}",
+                        torch_profiler_chrome_path,
+                    )
+                profiler_ctx = None
+
+            if (
                 device.type == "cuda"
                 and n_cuda_devices > 0
                 and step == 1
@@ -783,6 +886,17 @@ def train(
                 if not hw_sampler.start():
                     hw_sampler = None
 
+    if profiler_ctx is not None:
+        set_torch_profiler_active(False)
+        profiler_ctx.__exit__(None, None, None)
+        logger.info(
+            "Torch profiler (partial capture before loop exit):\n{}",
+            format_profiler_report(profiler_ctx),
+        )
+        if torch_profiler_chrome_path:
+            export_chrome_trace(profiler_ctx, torch_profiler_chrome_path)
+            logger.info("Torch profiler Chrome trace: {}", torch_profiler_chrome_path)
+
     if hw_sampler is not None:
         g_pct, sm_pct = hw_sampler.stop()
         if g_pct is not None:
@@ -791,7 +905,6 @@ def train(
             metrics.sm_efficiency_pct = sm_pct
 
     elapsed = time.time() - start_time
-    training_time_sec = sum(metrics._step_times) / 1000  # Convert ms to sec
 
     # Log final summary
     summary = metrics.summary()
@@ -800,11 +913,11 @@ def train(
     logger.info("Summary:")
     logger.info("  Avg step time: {:.1f}ms", summary["avg_step_time_ms"])
     logger.info(
-        "  Training throughput: {:.0f} cells/sec (excludes startup)",
-        summary["total_cells"] / training_time_sec if training_time_sec > 0 else 0,
+        "  Training throughput: {:.0f} cells/sec",
+        summary["median_cells_per_sec"],
     )
     logger.info(
-        "  Wall-clock throughput: {:.0f} cells/sec (includes startup)",
+        "  Wall-clock throughput: {:.0f} cells/sec",
         summary["total_cells"] / elapsed if elapsed > 0 else 0,
     )
     logger.info("  Total cells processed: {:,}", summary["total_cells"])
@@ -886,6 +999,34 @@ def main() -> None:
         action="store_true",
         help="Train with model weights in bf16 and no autocast (CUDA bf16 GPUs only)",
     )
+    parser.add_argument(
+        "--torch-profiler-steps",
+        type=int,
+        default=0,
+        help="CUDA: capture this many optimizer steps with torch.profiler (0=off)",
+    )
+    parser.add_argument(
+        "--torch-profiler-warmup-steps",
+        type=int,
+        default=2,
+        help="Optimizer steps to skip before torch profiler capture",
+    )
+    parser.add_argument(
+        "--torch-profiler-chrome-path",
+        type=str,
+        default="",
+        help="Write Chrome trace JSON to this path (empty=skip)",
+    )
+    parser.add_argument(
+        "--torch-profiler-record-shapes",
+        action="store_true",
+        help="Enable profiler record_shapes (heavier)",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-stack",
+        action="store_true",
+        help="Enable profiler with_stack (heavier)",
+    )
 
     args = parser.parse_args()
 
@@ -903,6 +1044,8 @@ def main() -> None:
     else:
         config = ModelConfig.large()
 
+    chrome = args.torch_profiler_chrome_path or None
+
     train(
         slaf_path=str(slaf_path),
         config=config,
@@ -912,6 +1055,11 @@ def main() -> None:
         learning_rate=args.learning_rate,
         log_every=args.log_every,
         use_strict_bf16=args.use_strict_bf16,
+        torch_profiler_steps=args.torch_profiler_steps,
+        torch_profiler_warmup_steps=args.torch_profiler_warmup_steps,
+        torch_profiler_chrome_path=chrome,
+        torch_profiler_record_shapes=args.torch_profiler_record_shapes,
+        torch_profiler_with_stack=args.torch_profiler_with_stack,
     )
 
 

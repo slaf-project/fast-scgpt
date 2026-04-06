@@ -53,6 +53,11 @@ class ModelConfig:
     # Logit softcapping (nanochat optimization)
     use_softcap: bool = False  # Apply tanh softcapping to prevent extreme logits
 
+    # Gene head: if True, training runs F.linear only at masked gene positions (no full
+    # (batch, seq_len, vocab_size) logits tensor). Inference / forward(skip_gene_logits=False)
+    # unchanged. See PRD 013 / approach (2).
+    sparse_gene_head: bool = False
+
     # Special token IDs (must match SLAF tokenizer)
     pad_token_id: int = 0
     cls_token_id: int = 1

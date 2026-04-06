@@ -1,5 +1,7 @@
 """Tests for Fast-scGPT model."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from fast_scgpt.model import (
     TokenEmbedding,
     TransformerBlock,
 )
+from fast_scgpt.train import create_mask
 
 
 @pytest.fixture
@@ -214,6 +217,79 @@ class TestScGPT:
         """Test creating model from config."""
         model = ScGPT.from_config(config)
         assert model.config == config
+
+    def test_sparse_gene_head_matches_dense_loss(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        """Approach (2): masked-only gene projection should match full head + CE."""
+        torch.manual_seed(42)
+        dense_cfg = replace(config, sparse_gene_head=False)
+        sparse_cfg = replace(config, sparse_gene_head=True)
+        dense_m = ScGPT(dense_cfg).to(device)
+        sparse_m = ScGPT(sparse_cfg).to(device)
+        sparse_m.load_state_dict(dense_m.state_dict())
+        dense_m.eval()
+        sparse_m.eval()
+
+        batch_size, seq_len = 2, 64
+        input_ids = torch.randint(
+            config.gene_token_offset,
+            config.vocab_size,
+            (batch_size, seq_len),
+            device=device,
+        )
+        attention_mask = torch.ones(
+            batch_size, seq_len, dtype=torch.bool, device=device
+        )
+
+        masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
+            input_ids,
+            attention_mask,
+            mask_token_id=config.mask_token_id,
+            gene_token_offset=config.gene_token_offset,
+            vocab_size=config.vocab_size,
+            expr_token_offset=config.expr_token_offset,
+            mask_ratio=0.15,
+        )
+
+        d = dense_m.compute_loss(
+            masked_input_ids,
+            attention_mask,
+            gene_targets,
+            expr_targets,
+            gene_mask,
+        )
+        s = sparse_m.compute_loss(
+            masked_input_ids,
+            attention_mask,
+            gene_targets,
+            expr_targets,
+            gene_mask,
+        )
+
+        assert torch.allclose(d["gene_loss"], s["gene_loss"], rtol=0, atol=0)
+        assert torch.allclose(d["expr_loss"], s["expr_loss"], rtol=0, atol=0)
+        assert torch.allclose(d["loss"], s["loss"], rtol=0, atol=0)
+
+    def test_sparse_gene_head_skip_forward_has_no_gene_logits(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        cfg = replace(config, sparse_gene_head=True)
+        model = ScGPT(cfg).to(device)
+        batch_size, seq_len = 2, 32
+        input_ids = torch.randint(
+            0, config.total_vocab_size, (batch_size, seq_len), device=device
+        )
+        attention_mask = torch.ones(
+            batch_size, seq_len, dtype=torch.bool, device=device
+        )
+        out = model(input_ids, attention_mask, skip_gene_logits=True)
+        assert "gene_logits" not in out
+        assert out["expr_logits"].shape == (
+            batch_size,
+            seq_len,
+            config.n_expression_bins,
+        )
 
 
 class TestTrainMasking:

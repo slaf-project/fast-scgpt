@@ -59,9 +59,11 @@ def compute_training_metrics(summary: dict) -> dict:
 
     Optionally from train_ddp metrics file: peak_memory_gb, memory_utilization_pct,
     gpu_utilization_pct, sm_efficiency_pct (nvidia-smi / dmon), training_elapsed_sec.
-    When training_elapsed_sec is present we use it for MFU,
-    throughput and steps_per_sec (so numbers match train_ddp's log); otherwise we use
-    elapsed_sec (total run time including startup).
+    When ``training_elapsed_sec`` is present we use it for MFU and achieved TFLOPS
+    (wall time for all optimizer steps, including a slow first step). Throughput and
+    ``steps_per_sec`` use ``median_cells_per_sec`` / ``median_step_time_ms`` when
+    provided so benchmark printouts match the training summary (median step, first
+    step omitted from median).
     """
     if summary.get("status") != "success":
         return {}
@@ -96,6 +98,13 @@ def compute_training_metrics(summary: dict) -> dict:
     )
     throughput_cells_per_sec = (effective_batch * n_steps) / elapsed
     steps_per_sec = n_steps / elapsed
+
+    median_cells = summary.get("median_cells_per_sec")
+    median_step_ms = summary.get("median_step_time_ms")
+    if median_cells is not None and float(median_cells) > 0:
+        throughput_cells_per_sec = float(median_cells)
+    if median_step_ms is not None and float(median_step_ms) > 0:
+        steps_per_sec = 1000.0 / float(median_step_ms)
 
     out = {
         "mfu_pct": round(mfu_pct, 2),

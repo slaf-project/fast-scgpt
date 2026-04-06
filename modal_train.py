@@ -16,6 +16,12 @@ Usage:
     # Test with minimal config
     modal run modal_train.py --batch-size 8 --max-genes 128 --n-steps 50
 
+    # PyTorch profiler (forward/backward CUDA breakdown; after compile warmup)
+    modal run modal_train.py --n-steps 12 --torch-profiler-steps 3 --torch-profiler-warmup-steps 2
+
+    # Masked-only gene LM head (PRD 013 / approach 2): smaller gene projection matmul
+    modal run modal_train.py --sparse-gene-head --n-steps 12 --torch-profiler-steps 3
+
     # Run in detached mode (continues after terminal closes)
     modal run --detach modal_train.py --n-steps 1000
 
@@ -78,8 +84,14 @@ def _train_on_modal_impl(
     use_lp_layernorm: bool,
     use_softcap: bool,
     use_strict_bf16: bool,
+    sparse_gene_head: bool,
     profile: bool,
     data_source: str,
+    torch_profiler_steps: int,
+    torch_profiler_warmup_steps: int,
+    torch_profiler_chrome_path: str | None,
+    torch_profiler_record_shapes: bool,
+    torch_profiler_with_stack: bool,
 ) -> dict:
     """Run training; ``flash_attn_backend`` is ``fa3`` or ``fa4`` (must match image)."""
     import os
@@ -176,6 +188,12 @@ def _train_on_modal_impl(
         config.use_softcap = True
         logger.info("Using logit softcapping (nanochat optimization)")
 
+    if sparse_gene_head:
+        config.sparse_gene_head = True
+        logger.info(
+            "Using sparse gene head (linear + CE only at masked positions; PRD 013 approach 2)"
+        )
+
     logger.info(f"Model size: {model_size}")
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Max genes: {max_genes}")
@@ -209,6 +227,11 @@ def _train_on_modal_impl(
         compile_mode=compile_mode,
         profile=profile,
         use_strict_bf16=use_strict_bf16,
+        torch_profiler_steps=torch_profiler_steps,
+        torch_profiler_warmup_steps=torch_profiler_warmup_steps,
+        torch_profiler_chrome_path=torch_profiler_chrome_path,
+        torch_profiler_record_shapes=torch_profiler_record_shapes,
+        torch_profiler_with_stack=torch_profiler_with_stack,
     )
     elapsed_sec = time.time() - start_time
 
@@ -222,6 +245,7 @@ def _train_on_modal_impl(
         "status": "success",
         "flash_attn_backend": flash_attn_backend,
         "flash_attn_label": attention_backend_label(),
+        "sparse_gene_head": sparse_gene_head,
         "n_steps": n_steps,
         "batch_size": batch_size,
         "effective_batch_size": effective_batch,
@@ -232,9 +256,7 @@ def _train_on_modal_impl(
         "num_gpus": 1,
         "avg_step_time_ms": summary["avg_step_time_ms"],
         "median_step_time_ms": median_ms,
-        "median_cells_per_sec": (
-            batch_size / (median_ms / 1000) if median_ms > 0 else 0
-        ),
+        "median_cells_per_sec": summary["median_cells_per_sec"],
         "total_cells": summary["total_cells"],
         "total_tokens": summary["total_tokens"],
         "peak_memory_gb": summary["peak_memory_gb"],
@@ -291,8 +313,14 @@ def train_on_modal(
     use_lp_layernorm: bool = False,
     use_softcap: bool = False,
     use_strict_bf16: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
+    torch_profiler_steps: int = 0,
+    torch_profiler_warmup_steps: int = 2,
+    torch_profiler_chrome_path: str | None = None,
+    torch_profiler_record_shapes: bool = False,
+    torch_profiler_with_stack: bool = False,
 ) -> dict:
     """FlashAttention via the pinned ``flash-attn`` wheel (``FAST_SCGPT_FLASH_ATTN_BACKEND=fa3``)."""
     return _train_on_modal_impl(
@@ -311,8 +339,14 @@ def train_on_modal(
         use_lp_layernorm=use_lp_layernorm,
         use_softcap=use_softcap,
         use_strict_bf16=use_strict_bf16,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
+        torch_profiler_steps=torch_profiler_steps,
+        torch_profiler_warmup_steps=torch_profiler_warmup_steps,
+        torch_profiler_chrome_path=torch_profiler_chrome_path,
+        torch_profiler_record_shapes=torch_profiler_record_shapes,
+        torch_profiler_with_stack=torch_profiler_with_stack,
     )
 
 
@@ -338,8 +372,14 @@ def train_on_modal_fa4(
     use_lp_layernorm: bool = False,
     use_softcap: bool = False,
     use_strict_bf16: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
+    torch_profiler_steps: int = 0,
+    torch_profiler_warmup_steps: int = 2,
+    torch_profiler_chrome_path: str | None = None,
+    torch_profiler_record_shapes: bool = False,
+    torch_profiler_with_stack: bool = False,
 ) -> dict:
     """FlashAttention-4 (``pip install flash-attn-4``; ``FAST_SCGPT_FLASH_ATTN_BACKEND=fa4``)."""
     return _train_on_modal_impl(
@@ -358,8 +398,14 @@ def train_on_modal_fa4(
         use_lp_layernorm=use_lp_layernorm,
         use_softcap=use_softcap,
         use_strict_bf16=use_strict_bf16,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
+        torch_profiler_steps=torch_profiler_steps,
+        torch_profiler_warmup_steps=torch_profiler_warmup_steps,
+        torch_profiler_chrome_path=torch_profiler_chrome_path,
+        torch_profiler_record_shapes=torch_profiler_record_shapes,
+        torch_profiler_with_stack=torch_profiler_with_stack,
     )
 
 
@@ -379,9 +425,15 @@ def main(
     use_lp_layernorm: bool = False,
     use_softcap: bool = False,
     use_strict_bf16: bool = False,
+    sparse_gene_head: bool = False,
     profile: bool = False,
     data_source: str = "s3",
     flash_attn_backend: str = "fa3",
+    torch_profiler_steps: int = 0,
+    torch_profiler_warmup_steps: int = 2,
+    torch_profiler_chrome_path: str | None = None,
+    torch_profiler_record_shapes: bool = False,
+    torch_profiler_with_stack: bool = False,
 ) -> None:
     """Run training benchmark from local machine.
 
@@ -399,9 +451,15 @@ def main(
         use_swiglu: Use SwiGLU activation instead of GELU
         use_lp_layernorm: Force LayerNorm to stay in bf16
         use_softcap: Apply logit softcapping (nanochat)
+        sparse_gene_head: Gene LM head only at masked positions (no full-seq logits matmul)
         profile: Log timing breakdown per step
         data_source: Data source - "s3", "volume", or "hf"
         flash_attn_backend: "fa3" (flash-attn wheel) or "fa4" (flash-attn-4 image)
+        torch_profiler_steps: PyTorch profiler: capture this many optimizer steps (0=off)
+        torch_profiler_warmup_steps: Optimizer steps to skip before capture
+        torch_profiler_chrome_path: Optional path for Chrome trace JSON on the worker
+        torch_profiler_record_shapes: Profiler record_shapes (heavier)
+        torch_profiler_with_stack: Profiler with_stack (heavier)
     """
     if flash_attn_backend not in ("fa3", "fa4"):
         raise ValueError("flash_attn_backend must be 'fa3' or 'fa4'")
@@ -420,9 +478,15 @@ def main(
     print(f"  use_lp_layernorm={use_lp_layernorm}")
     print(f"  use_softcap={use_softcap}")
     print(f"  use_strict_bf16={use_strict_bf16}")
+    print(f"  sparse_gene_head={sparse_gene_head}")
     print(f"  profile={profile}")
     print(f"  data_source={data_source}")
     print(f"  flash_attn_backend={flash_attn_backend}")
+    print(f"  torch_profiler_steps={torch_profiler_steps}")
+    print(f"  torch_profiler_warmup_steps={torch_profiler_warmup_steps}")
+    print(f"  torch_profiler_chrome_path={torch_profiler_chrome_path!r}")
+    print(f"  torch_profiler_record_shapes={torch_profiler_record_shapes}")
+    print(f"  torch_profiler_with_stack={torch_profiler_with_stack}")
     print()
 
     result = train_fn.remote(
@@ -440,8 +504,14 @@ def main(
         use_lp_layernorm=use_lp_layernorm,
         use_softcap=use_softcap,
         use_strict_bf16=use_strict_bf16,
+        sparse_gene_head=sparse_gene_head,
         profile=profile,
         data_source=data_source,
+        torch_profiler_steps=torch_profiler_steps,
+        torch_profiler_warmup_steps=torch_profiler_warmup_steps,
+        torch_profiler_chrome_path=torch_profiler_chrome_path,
+        torch_profiler_record_shapes=torch_profiler_record_shapes,
+        torch_profiler_with_stack=torch_profiler_with_stack,
     )
 
     print()

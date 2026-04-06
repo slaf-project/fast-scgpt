@@ -45,6 +45,27 @@ def _stop_producer_workers(producer_loader: object | None) -> None:
         )
 
 
+def _close_distributed_dataloader_iter(iterator: object | None) -> None:
+    """Close SLAF ``DistributedDataLoader`` iterator so prefetch threads exit.
+
+    Leaving training early without exhausting the iterator skips the generator
+    ``finally`` (``_should_stop`` + ``thread.join``). Daemon threads stuck in
+    ``queue.get_many`` during NCCL/modal teardown can trigger SIGABRT / "exception
+    not rethrown".
+    """
+    if iterator is None:
+        return
+    closer = getattr(iterator, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as e:
+        logger.warning(
+            "DistributedDataLoader iterator.close() failed (non-fatal): %s", e
+        )
+
+
 @dataclass
 class DistributedMetrics:
     """Metrics for distributed training."""
@@ -55,30 +76,58 @@ class DistributedMetrics:
     memory_utilization_pct: float = 0.0
     _step_times: list[float] = field(default_factory=list)
     _cells_processed: int = 0
+    _local_cells_per_optimizer_step: int = 0
     world_size: int = 1
 
     def update(
-        self, step_time_ms: float, batch_size: int, device: torch.device
+        self,
+        step_time_ms: float,
+        batch_size: int,
+        device: torch.device,
+        *,
+        peak_memory_gb: float | None = None,
+        memory_utilization_pct: float | None = None,
     ) -> None:
+        """``batch_size`` is local cells per optimizer step (micro-batch × accum).
+
+        Pass ``peak_memory_gb`` / ``memory_utilization_pct`` when they were
+        all-reduced across ranks so logs match the slowest GPU and max VRAM.
+        """
         self.step_time_ms = step_time_ms
         self._step_times.append(step_time_ms)
+        self._local_cells_per_optimizer_step = batch_size
         step_time_sec = step_time_ms / 1000.0
         total_batch = batch_size * self.world_size
         self.cells_per_sec = total_batch / step_time_sec if step_time_sec > 0 else 0
         self._cells_processed += batch_size
-        if device.type == "cuda":
+        if peak_memory_gb is not None:
+            self.peak_memory_gb = peak_memory_gb
+            self.memory_utilization_pct = float(
+                memory_utilization_pct if memory_utilization_pct is not None else 0.0
+            )
+        elif device.type == "cuda":
             self.peak_memory_gb = torch.cuda.max_memory_allocated(device) / 1e9
             total_memory = torch.cuda.get_device_properties(device).total_memory / 1e9
             self.memory_utilization_pct = (self.peak_memory_gb / total_memory) * 100
+        else:
+            self.peak_memory_gb = 0.0
+            self.memory_utilization_pct = 0.0
 
     def summary(self) -> dict[str, float]:
         times = self._step_times[1:] if len(self._step_times) > 1 else self._step_times
         avg_time = sum(times) / len(times) if times else 0
         median_time = sorted(times)[len(times) // 2] if times else 0
+        global_per_step = self._local_cells_per_optimizer_step * self.world_size
+        median_cells_per_sec = (
+            global_per_step / (median_time / 1000.0)
+            if median_time > 0 and global_per_step > 0
+            else 0.0
+        )
         return {
             "avg_step_time_ms": avg_time,
             "median_step_time_ms": median_time,
             "total_cells": self._cells_processed,
+            "median_cells_per_sec": median_cells_per_sec,
             "peak_memory_gb": self.peak_memory_gb,
             "memory_utilization_pct": self.memory_utilization_pct,
         }
@@ -162,12 +211,17 @@ def train_ddp(
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
     profile: bool = False,
+    model_size: str = "small",
 ) -> DistributedMetrics:
-    """Train with native PyTorch DDP."""
+    """Train with native PyTorch DDP.
+
+    ``model_size`` is used only for MFU logging / JSON (must match ``config`` preset).
+    """
     # Setup distributed
     rank, world_size, device = setup_distributed()
     is_main = rank == 0
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    _producer_loader_ref: object | None = None
 
     if config is None:
         config = ModelConfig.small()
@@ -321,10 +375,15 @@ def train_ddp(
             f"Starting training: {n_steps} steps, batch={batch_size}, "
             f"grad_accum={gradient_accumulation_steps}, effective={effective_batch}"
         )
+        logger.info(
+            "DDP step logs use max step time and max peak VRAM across ranks (honest global throughput). "
+            "Step 1 is often much slower (queue warmup, CUDA init, FA4/CuTe JIT if using fa4)."
+        )
 
     step = 0
     micro_step = 0
     accum_step_ms = 0.0
+    accum_e2e_dl_ms = 0.0
     total_loss = 0.0
     start_time = time.time()
     first_loss = None
@@ -397,12 +456,30 @@ def train_ddp(
         t_mask = time.perf_counter()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(masked_input_ids, attention_mask)
-            gene_logits = outputs["gene_logits"]
-            gene_loss = torch.nn.functional.cross_entropy(
-                gene_logits[gene_mask], gene_targets[gene_mask], ignore_index=-100
+            outputs = model(
+                masked_input_ids,
+                attention_mask,
+                skip_gene_logits=config.sparse_gene_head,
             )
             expr_logits = outputs["expr_logits"]
+            if config.sparse_gene_head:
+                inner = model.module if hasattr(model, "module") else model
+                h = outputs["hidden_states"]
+                gene_logits_m = inner.gene_head(h[gene_mask])
+                if inner.config.use_softcap:
+                    gene_logits_m = 15.0 * torch.tanh(gene_logits_m / 15.0)
+                gene_loss = torch.nn.functional.cross_entropy(
+                    gene_logits_m,
+                    gene_targets[gene_mask],
+                    ignore_index=-100,
+                )
+            else:
+                gene_logits = outputs["gene_logits"]
+                gene_loss = torch.nn.functional.cross_entropy(
+                    gene_logits[gene_mask],
+                    gene_targets[gene_mask],
+                    ignore_index=-100,
+                )
             expr_mask = torch.zeros_like(gene_mask)
             expr_mask[:, 1:] = gene_mask[:, :-1]
             valid_gene_mask = gene_mask.clone()
@@ -434,6 +511,7 @@ def train_ddp(
         t_optim = time.perf_counter()
         step_time_ms = (t_optim - step_start) * 1000
         accum_step_ms += step_time_ms
+        accum_e2e_dl_ms += dl_ms
 
         if profile:
             mask_ms = (t_mask - t_after_clip) * 1000
@@ -453,14 +531,49 @@ def train_ddp(
             first_loss = loss_val
 
         if is_accumulation_boundary:
-            metrics.update(
-                accum_step_ms,
-                batch_size * gradient_accumulation_steps,
-                device,
-            )
+            # End-to-end step time includes queue wait + host→device copy + compute.
+            # (Compute-only time can look artificially good, especially in DDP.)
+            local_step_ms = accum_step_ms + accum_e2e_dl_ms
+            if world_size > 1:
+                t_step = torch.tensor(
+                    [local_step_ms], dtype=torch.float32, device=device
+                )
+                dist.all_reduce(t_step, op=dist.ReduceOp.MAX)
+                cluster_step_ms = float(t_step.item())
+                if device.type == "cuda":
+                    peak_local = torch.cuda.max_memory_allocated(device) / 1e9
+                    t_mem = torch.tensor(
+                        [peak_local], dtype=torch.float32, device=device
+                    )
+                    dist.all_reduce(t_mem, op=dist.ReduceOp.MAX)
+                    cluster_peak_gb = float(t_mem.item())
+                    total_mem = (
+                        torch.cuda.get_device_properties(device).total_memory / 1e9
+                    )
+                    cluster_util = (cluster_peak_gb / total_mem) * 100
+                    metrics.update(
+                        cluster_step_ms,
+                        batch_size * gradient_accumulation_steps,
+                        device,
+                        peak_memory_gb=cluster_peak_gb,
+                        memory_utilization_pct=cluster_util,
+                    )
+                else:
+                    metrics.update(
+                        cluster_step_ms,
+                        batch_size * gradient_accumulation_steps,
+                        device,
+                    )
+            else:
+                metrics.update(
+                    local_step_ms,
+                    batch_size * gradient_accumulation_steps,
+                    device,
+                )
             step += 1
             micro_step = 0
             accum_step_ms = 0.0
+            accum_e2e_dl_ms = 0.0
             if (
                 device.type == "cuda"
                 and local_rank == 0
@@ -504,6 +617,20 @@ def train_ddp(
                 accum_optim_ms
             ) = 0.0
 
+    # --- Orderly shutdown: stop producers so the queue drains, then close consumer
+    # iterators (runs SLAF prefetch ``finally`` / thread join). Do this before more
+    # collectives so worker threads are not calling Modal + NCCL concurrently.
+    if is_main:
+        _stop_producer_workers(_producer_loader_ref)
+        _producer_loader_ref = None
+    dist.barrier()
+
+    _close_distributed_dataloader_iter(dataloader_iter)
+    del dataloader_iter, dataloader
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    dist.barrier()
+
     # Summary
     elapsed = time.time() - start_time
     summary = metrics.summary()
@@ -541,12 +668,14 @@ def train_ddp(
         [summary["memory_utilization_pct"]], dtype=torch.float32, device=device
     )
     dist.all_reduce(util_pct_tensor, op=dist.ReduceOp.MAX)
-    # Use sum of step times (actual compute) so Modal reports same throughput as this log
+    # Use sum of step times (end-to-end) so Modal reports same throughput as this log
     training_elapsed_sec = sum(metrics._step_times) / 1000.0
     metrics_for_modal = {
         "peak_memory_gb": round(peak_gb_tensor.item(), 2),
         "memory_utilization_pct": round(util_pct_tensor.item(), 1),
         "training_elapsed_sec": round(training_elapsed_sec, 2),
+        "median_cells_per_sec": round(summary["median_cells_per_sec"], 1),
+        "median_step_time_ms": round(summary["median_step_time_ms"], 2),
     }
     if avg_g is not None:
         metrics_for_modal["gpu_utilization_pct"] = round(avg_g, 1)
@@ -558,28 +687,62 @@ def train_ddp(
             json.dump(metrics_for_modal, f, indent=2)
 
     if is_main:
-        # Stop Modal CPU producer workers so they don't keep running (avoid burning $).
-        _stop_producer_workers(_producer_loader_ref)
-        # Release producer loader before barrier/cleanup so its teardown (threads, Modal)
-        # runs while process group is still alive; avoids SIGABRT on process exit.
-        _producer_loader_ref = None
-        total_cells = summary["total_cells"] * world_size
-        training_time = sum(metrics._step_times) / 1000
         logger.info("─" * 60)
         logger.info(f"Training complete: {step} steps in {elapsed:.1f}s")
         logger.info(f"  World size: {world_size} GPUs")
         logger.info(f"  Median step time: {summary['median_step_time_ms']:.0f}ms")
-        if training_time > 0:
-            logger.info(f"  Throughput: {total_cells / training_time:.0f} cells/sec")
+        if metrics._step_times:
+            logger.info(
+                "  Training throughput: {:.0f} cells/sec",
+                summary["median_cells_per_sec"],
+            )
         else:
             logger.info("  Throughput: N/A (no steps)")
         logger.info(f"  Peak memory: {summary['peak_memory_gb']:.1f}GB")
+        if avg_g is not None:
+            logger.info(
+                "  GPU utilization (nvidia-smi): {:.1f}%",
+                avg_g,
+            )
+        if avg_s is not None:
+            logger.info(
+                "  SM efficiency (nvidia-smi dmon sm): {:.1f}%",
+                avg_s,
+            )
+        try:
+            from fast_scgpt.training_metrics import compute_training_metrics
+
+            tm = compute_training_metrics(
+                {
+                    "status": "success",
+                    "elapsed_sec": elapsed,
+                    "training_elapsed_sec": training_elapsed_sec,
+                    "n_steps": step,
+                    "effective_batch_size": batch_size
+                    * gradient_accumulation_steps
+                    * world_size,
+                    "num_gpus": world_size,
+                    "max_genes": max_genes,
+                    "model_size": model_size,
+                    "gpu_name": torch.cuda.get_device_name(device),
+                    "median_cells_per_sec": summary["median_cells_per_sec"],
+                    "median_step_time_ms": summary["median_step_time_ms"],
+                }
+            )
+            if tm.get("mfu_pct") is not None:
+                logger.info("  MFU: {:.2f}%", tm["mfu_pct"])
+        except Exception as e:
+            logger.debug("compute_training_metrics (rank0 log only): {}", e)
         if first_loss and last_loss:
             logger.info(f"  Loss: {first_loss:.4f} → {last_loss:.4f}")
         logger.info("─" * 60)
 
     # Sync all ranks before cleanup (whether we hit n_steps or StopIteration)
     dist.barrier()
+    del optimizer
+    del model
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     cleanup_distributed()
     return metrics
 
@@ -599,7 +762,10 @@ def main() -> None:
         help="Accumulate gradients over N micro-steps before optimizer step (effective_batch = batch_size * this * world_size)",
     )
     parser.add_argument(
-        "--model_size", type=str, default="small", choices=["small", "base", "large"]
+        "--model_size",
+        type=str,
+        default="small",
+        choices=["small", "scgpt", "base", "large"],
     )
     parser.add_argument("--use_gradient_checkpointing", action="store_true")
     parser.add_argument(
@@ -612,14 +778,24 @@ def main() -> None:
         action="store_true",
         help="Log timing breakdown (dl=queue+transfer, mask, forward, backward, optim)",
     )
+    parser.add_argument(
+        "--sparse-gene-head",
+        action="store_true",
+        dest="sparse_gene_head",
+        help="Gene LM head only at masked positions (same as single-GPU / PRD 013 approach 2)",
+    )
     args = parser.parse_args()
 
     if args.model_size == "small":
         config = ModelConfig.small()
+    elif args.model_size == "scgpt":
+        config = ModelConfig.scgpt_matched()
     elif args.model_size == "base":
         config = ModelConfig.base()
     else:
         config = ModelConfig.large()
+    if args.sparse_gene_head:
+        config.sparse_gene_head = True
 
     train_ddp(
         slaf_path=args.slaf_path,
@@ -633,6 +809,7 @@ def main() -> None:
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_compile=args.use_compile,
         profile=args.profile,
+        model_size=args.model_size,
     )
 
 

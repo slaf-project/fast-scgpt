@@ -6,16 +6,28 @@ Architecture innovations from modded-nanogpt:
 """
 
 import math
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from loguru import logger
+from torch.autograd.profiler import record_function
 from torch.utils.checkpoint import checkpoint
 
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.lp_layernorm import LPLayerNorm
+from fast_scgpt.training_profiler import torch_profiler_active
+
+
+def _prof_region(name: str) -> AbstractContextManager[Any]:
+    """Narrow profiler region; active only when ``train(torch_profiler_steps>0)`` sets env."""
+    return cast(
+        AbstractContextManager[Any],
+        record_function(name) if torch_profiler_active() else nullcontext(),
+    )
 
 
 class TiedLinear(nn.Module):
@@ -226,10 +238,12 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Core forward implementation."""
-        # Pre-norm attention
-        x = x + self.dropout(self.attention(self.norm1(x), attention_mask))
-        # Pre-norm feed-forward
-        x = x + self.dropout(self.ff(self.norm2(x)))
+        with _prof_region("scgpt.block.attn"):
+            # Pre-norm attention
+            x = x + self.dropout(self.attention(self.norm1(x), attention_mask))
+        with _prof_region("scgpt.block.ff"):
+            # Pre-norm feed-forward
+            x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
     def forward(
@@ -334,6 +348,8 @@ class ScGPT(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        *,
+        skip_gene_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Forward pass through the model.
 
@@ -342,37 +358,49 @@ class ScGPT(nn.Module):
                 Format: [CLS] gene1 expr1 gene2 expr2 ... [SEP] [PAD]
             attention_mask: Boolean mask of shape (batch, seq_len).
                 True for real tokens, False for padding.
+            skip_gene_logits: If True, skip the gene output projection (avoids the full
+                ``(batch, seq_len, vocab_size)`` matmul). Use with ``sparse_gene_head``
+                training. ``expr_logits`` and ``hidden_states`` remain full length.
+                When True, ``gene_logits`` is omitted from the returned dict.
 
         Returns:
             dict with:
-                - gene_logits: Logits for gene prediction (batch, seq_len, vocab_size)
+                - gene_logits: Logits for gene prediction (batch, seq_len, vocab_size),
+                  omitted when ``skip_gene_logits`` is True
                 - expr_logits: Logits for expression prediction (batch, seq_len, n_bins)
                 - hidden_states: Final hidden states (batch, seq_len, d_model)
         """
-        # Embed tokens
-        x = self.embedding(input_ids)
+        with _prof_region("scgpt.embed"):
+            x = self.embedding(input_ids)
 
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x, attention_mask)
+        with _prof_region("scgpt.blocks"):
+            for block in self.blocks:
+                x = block(x, attention_mask)
 
-        # Final layer norm
-        x = self.norm_f(x)
+        with _prof_region("scgpt.norm_f"):
+            x = self.norm_f(x)
 
-        # Output heads
-        gene_logits = self.gene_head(x)
-        expr_logits = self.expr_head(x)
+        gene_logits: torch.Tensor | None = None
+        if not skip_gene_logits:
+            with _prof_region("scgpt.gene_head"):
+                gene_logits = self.gene_head(x)
+        with _prof_region("scgpt.expr_head"):
+            expr_logits = self.expr_head(x)
 
         # Apply logit softcapping if enabled (nanochat optimization)
         if self.config.use_softcap:
-            gene_logits = 15.0 * torch.tanh(gene_logits / 15.0)
-            expr_logits = 15.0 * torch.tanh(expr_logits / 15.0)
+            with _prof_region("scgpt.softcap"):
+                if gene_logits is not None:
+                    gene_logits = 15.0 * torch.tanh(gene_logits / 15.0)
+                expr_logits = 15.0 * torch.tanh(expr_logits / 15.0)
 
-        return {
-            "gene_logits": gene_logits,
+        out: dict[str, torch.Tensor] = {
             "expr_logits": expr_logits,
             "hidden_states": x,
         }
+        if gene_logits is not None:
+            out["gene_logits"] = gene_logits
+        return out
 
     def compute_loss(
         self,
@@ -398,15 +426,34 @@ class ScGPT(nn.Module):
                 - gene_loss: Cross-entropy loss for gene prediction
                 - expr_loss: Cross-entropy loss for expression prediction
         """
-        outputs = self.forward(input_ids, attention_mask)
+        outputs = self.forward(
+            input_ids,
+            attention_mask,
+            skip_gene_logits=self.config.sparse_gene_head,
+        )
 
         # Gene loss: only on masked gene positions
-        gene_logits = outputs["gene_logits"]
-        gene_loss = F.cross_entropy(
-            gene_logits[gene_mask],
-            gene_targets[gene_mask],
-            ignore_index=-100,
-        )
+        if self.config.sparse_gene_head:
+            hidden = outputs["hidden_states"]
+            with _prof_region("scgpt.gene_head"):
+                gene_logits_m = self.gene_head(hidden[gene_mask])
+            if self.config.use_softcap:
+                with _prof_region("scgpt.softcap"):
+                    gene_logits_m = 15.0 * torch.tanh(gene_logits_m / 15.0)
+            with _prof_region("scgpt.gene_ce"):
+                gene_loss = F.cross_entropy(
+                    gene_logits_m,
+                    gene_targets[gene_mask],
+                    ignore_index=-100,
+                )
+        else:
+            gene_logits = outputs["gene_logits"]
+            with _prof_region("scgpt.gene_ce"):
+                gene_loss = F.cross_entropy(
+                    gene_logits[gene_mask],
+                    gene_targets[gene_mask],
+                    ignore_index=-100,
+                )
 
         # Expression loss: predict expression at expr position (gene_pos + 1)
         # But expr_targets are stored at gene_mask positions for simplicity
@@ -423,11 +470,12 @@ class ScGPT(nn.Module):
         valid_gene_mask[:, -1] = False  # Genes at last position have no expr slot
 
         # Get targets and logits - targets at gene positions, logits at expr positions
-        expr_loss = F.cross_entropy(
-            expr_logits[expr_mask],
-            expr_targets[valid_gene_mask],
-            ignore_index=-100,
-        )
+        with _prof_region("scgpt.expr_ce"):
+            expr_loss = F.cross_entropy(
+                expr_logits[expr_mask],
+                expr_targets[valid_gene_mask],
+                ignore_index=-100,
+            )
 
         total_loss = gene_loss + expr_loss
 
