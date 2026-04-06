@@ -286,7 +286,8 @@ def train_step(
         optimizer: The optimizer
         config: Model configuration
         device: Device to train on
-        scaler: GradScaler for mixed precision (CUDA only)
+        scaler: ``torch.amp.GradScaler`` for fp16 autocast only; bf16 uses plain
+            ``loss.backward()`` like ``train_ddp``
         use_amp: Whether to use automatic mixed precision
         gradient_accumulation_steps: Number of steps to accumulate gradients
         is_accumulation_boundary: If True, perform optimizer step after backward
@@ -303,9 +304,10 @@ def train_step(
         t_start = time.perf_counter()
 
     with _torch_prof_region("scgpt.data"):
-        # Move batch to device
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        # Move batch to device (non_blocking matches train_ddp; best with pinned CPU tensors)
+        _nb = device.type == "cuda"
+        input_ids = batch["input_ids"].to(device, non_blocking=_nb)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=_nb)
 
         # Clip expression tokens to valid range (workaround for SLAF tokenizer bug)
         input_ids = clip_expression_tokens(
@@ -552,12 +554,17 @@ def train(
         fused=True,
     )
 
-    # Mixed precision training (CUDA only; disabled when strict bf16 owns dtypes)
+    # Mixed precision training (CUDA only; disabled when strict bf16 owns dtypes).
+    # bf16 autocast: no GradScaler (same as train_ddp). fp16 autocast keeps scaler for stability.
     use_amp = device.type == "cuda" and not strict_bf16_active
-    scaler = torch.amp.GradScaler() if use_amp else None
+    use_bf16_autocast = bool(use_amp and torch.cuda.is_bf16_supported())
+    scaler = torch.amp.GradScaler() if use_amp and not use_bf16_autocast else None
     if use_amp:
-        amp_dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
-        logger.info("Mixed precision enabled: {}", amp_dtype)
+        amp_dtype = "bf16" if use_bf16_autocast else "fp16"
+        if use_bf16_autocast:
+            logger.info("Mixed precision enabled: {} (no GradScaler)", amp_dtype)
+        else:
+            logger.info("Mixed precision enabled: {} with GradScaler", amp_dtype)
 
     t0 = time.time()
     dataloader = SLAFDataLoader(
