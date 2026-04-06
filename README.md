@@ -86,13 +86,13 @@ Multi-node uses Modal’s experimental clustered API (`efa_enabled` in the image
 
 | Flag / topic | Notes |
 |--------------|--------|
-| **`model-size`** | `small` **35,362,304**, `scgpt` **51,061,760**, `base` **102,045,696**, `large` **430,632,960** trainable parameters (`ScGPT` + default `ModelConfig` vocab / bins; **`scgpt`** uses weight tying). Same totals as `fast_scgpt.training_metrics.get_param_count()`. |
-| **`data-source`** | `hf` (HF dataset URI), `s3` (needs `s3-credentials` secret), `volume` (path on Modal volume). |
-| **`modal_train.py` only** | Optional Modal CLI flags (examples): `--use-compile`, `--compile-mode`, `--use-swiglu`, `--use-lp-layernorm`, `--use-softcap`, `--use-strict-bf16`, `--use-gradient-checkpointing`, `--profile`. Implementation lives in `fast_scgpt/` (e.g. `lp_layernorm.py`, `strict_bf16.py`) and `train()`; see `train_on_modal` / `main` in `modal_train.py`. |
-| **`modal_train_distributed.py`** | Per-GPU micro-batch is `batch_size`; effective global batch ≈ `batch_size × gradient_accumulation_steps × num_gpus`. |
-| **Local CPU/GPU (no Modal)** | After installing with the `slaf` extra if you need SLAF I/O: `python -m fast_scgpt.train --slaf_path /path/to/dataset.slaf` |
+| **`model-size`** | Presets: `small` **35,362,304**, `scgpt` **51,061,760**, `base` **102,045,696**, `large` **430,632,960** trainable parameters (default `ModelConfig` vocab / bins; **`scgpt`** uses weight tying). Matches `fast_scgpt.training_metrics.get_param_count()`. **Modal** `modal_train.py` / `modal_train_distributed.py`: all four. **Local** `python -m fast_scgpt.train`: **`--model_size`** is only **`small` \| `base` \| `large`** today—no CLI preset for `scgpt` (use Python / Modal for `scgpt`). |
+| **`data-source`** | `hf`, `s3`, `volume` (see Prerequisites). Default **both** Modal scripts: **`s3`**. |
+| **`modal_train.py`** | Extra knobs not present on distributed: `--compile-mode`, `--use-swiglu`, `--use-lp-layernorm`, `--use-softcap`, `--use-strict-bf16`, `--torch-profiler-steps`, `--torch-profiler-warmup-steps`, `--torch-profiler-chrome-path`, etc. Shared: `--use-compile`, `--use-gradient-checkpointing`, `--sparse-gene-head`, `--profile`, **`--flash-attn-backend`** (`fa3` default, **`fa4`** for the Flash Attention 4 image). See `main()` in `modal_train.py`. |
+| **`modal_train_distributed.py`** | Per-GPU batch = `batch_size`; effective global batch ≈ **`batch_size × gradient_accumulation_steps × num_gpus`** (8 single-node, 16 with `--multinode`). Flags include **`--use-compile`**, **`--sparse-gene-head`**, **`--profile`**, **`--multinode`**, **`--flash-attn-backend`**. No SwiGLU / LP-LayerNorm / softcap / strict-bf16 toggles on this entrypoint—use `modal_train.py` or change the script if you need them. |
+| **Local CPU/GPU (no Modal)** | `python -m fast_scgpt.train --slaf_path /path/to/dataset.slaf` (install **`slaf`** / dataset I/O deps as needed). Defaults in argparse: `batch_size=32`, **`max_genes=512`**, `log_every=10`, plus **torch-profiler** flags; see `main()` in `fast_scgpt/train.py`. |
 
-Defaults differ between scripts (for example distributed defaults to a larger `model_size` and `max_genes`); override explicitly for comparable runs.
+**Modal defaults (when you pass no overrides):** `modal_train.py` → `batch_size=32`, `max_genes=64`, **`model_size=small`**, `data_source=s3`. `modal_train_distributed.py` → **`batch_size=64`**, **`max_genes=1024`**, **`model_size=base`**, `data_source=s3`. Match these explicitly when comparing scripts.
 
 ## Benchmarks
 
@@ -105,6 +105,20 @@ Representative **Modal** distributed run via `modal_train_distributed.py`:
 - **Batch:** 128 cells per GPU per step → **effective global batch 1024**
 - **Sequence:** max genes **512**
 - **Data:** Tahoe-100M, streamed into Modal from **S3** through the distributed dataloader with **2 CPU** prefetch workers
+
+**Command** (from repo root; requires Modal + `s3-credentials` and the SLAF distributed dataloader deploy as in `modal_train_distributed.py`):
+
+```bash
+modal run modal_train_distributed.py \
+  --model-size scgpt \
+  --n-steps 50 \
+  --batch-size 128 \
+  --max-genes 512 \
+  --data-source s3 \
+  --flash-attn-backend fa4 \
+  --sparse-gene-head \
+  --no-use-compile
+```
 
 | Metric | Value |
 |--------|--------|
@@ -130,9 +144,24 @@ Representative **Modal** distributed run via `modal_train_distributed.py`:
 
 ### `scgpt` (51,061,760 parameters) on 1× NVIDIA H200 (Modal)
 
-Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **Flash Attention 4**, **`--no-use-compile`**, **50 steps**, **128 cells/step** (effective batch **128**), **max genes 512**.
+Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **Flash Attention 4**, **`--no-use-compile`**, **`--sparse-gene-head`**, **`--profile`** (step timing breakdown), **50 steps**, **128 cells/step** (effective batch **128**), **max genes 512**, **S3** data source.
 
-**Breakdown of time within traming step (steady state)** — With **`profile=True`** in `train()` (see `modal_train.py`), logs include chunks measured inside `train_step()` (CUDA-synchronized intervals; see `fast_scgpt/train.py`). Below is a representative step.
+**Command** (from repo root):
+
+```bash
+modal run modal_train.py \
+  --model-size scgpt \
+  --n-steps 50 \
+  --batch-size 128 \
+  --max-genes 512 \
+  --data-source s3 \
+  --flash-attn-backend fa4 \
+  --profile \
+  --sparse-gene-head \
+  --no-use-compile
+```
+
+**Breakdown of time within training step (steady state)** — With **`profile=True`**, logs include chunks measured inside `train_step()` (CUDA-synchronized intervals; see `fast_scgpt/train.py`). Below is a representative step.
 
 | Phase | Time (ms) | What it measures |
 |-------|-----------|------------------|
@@ -157,11 +186,3 @@ Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **F
 
 
 **Util / SM%:** On this single-GPU trace, **`nvidia-smi` / `dmon`** sample the only training device for the whole job—usually easier to interpret than the short 8-GPU run’s rank-0-only hardware sample.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-MIT — see [LICENSE.md](LICENSE.md).
