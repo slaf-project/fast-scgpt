@@ -86,7 +86,7 @@ Multi-node uses Modal’s experimental clustered API (`efa_enabled` in the image
 
 | Flag / topic | Notes |
 |--------------|--------|
-| **`model-size`** | `small` (dev), `scgpt` (~51M, paper-like), `base` (~102M), `large` (scaling). |
+| **`model-size`** | `small` **35,362,304**, `scgpt` **51,061,760**, `base` **102,045,696**, `large` **430,632,960** trainable parameters (`ScGPT` + default `ModelConfig` vocab / bins; **`scgpt`** uses weight tying). Same totals as `fast_scgpt.training_metrics.get_param_count()`. |
 | **`data-source`** | `hf` (HF dataset URI), `s3` (needs `s3-credentials` secret), `volume` (path on Modal volume). |
 | **`modal_train.py` only** | Optional Modal CLI flags (examples): `--use-compile`, `--compile-mode`, `--use-swiglu`, `--use-lp-layernorm`, `--use-softcap`, `--use-strict-bf16`, `--use-gradient-checkpointing`, `--profile`. Implementation lives in `fast_scgpt/` (e.g. `lp_layernorm.py`, `strict_bf16.py`) and `train()`; see `train_on_modal` / `main` in `modal_train.py`. |
 | **`modal_train_distributed.py`** | Per-GPU micro-batch is `batch_size`; effective global batch ≈ `batch_size × gradient_accumulation_steps × num_gpus`. |
@@ -96,7 +96,67 @@ Defaults differ between scripts (for example distributed defaults to a larger `m
 
 ## Benchmarks
 
-_Coming soon._
+### `scgpt` (51,061,760 parameters) on 8× NVIDIA H100 (single node, 80GB per GPU)
+
+Representative **Modal** distributed run via `modal_train_distributed.py`:
+
+- **Attention:** Flash Attention 4
+- **Run length:** 50 steps (short benchmark; see note below on longer jobs)
+- **Batch:** 128 cells per GPU per step → **effective global batch 1024**
+- **Sequence:** max genes **512**
+- **Data:** Tahoe-100M, streamed into Modal from **S3** through the distributed dataloader with **2 CPU** prefetch workers
+
+| Metric | Value |
+|--------|--------|
+| **Median step time** | **56 ms** (steady state; sub-100 ms per step at 128 cells/GPU) |
+| **Global throughput** | **~18.3k cells/s** |
+| **Steps/s** | **~18** |
+| **Training compute (50 steps)** | **~23.5 s** wall time (end-to-end job ~95 s including startup/teardown) |
+| **Peak GPU memory** | **~71.7 GB / GPU** (~84%) |
+| **MFU** | **~17.3%** |
+| **Achieved TFLOPS** | **~1370 total** (~171 per GPU) |
+
+**How these numbers are defined (8-GPU run)** — implementation detail in `fast_scgpt/train_ddp.py`:
+
+- **Median step time** and **peak GPU memory:** each step uses a **max reduce over the 8 ranks** (slowest rank’s end-to-end step time; highest peak VRAM among peers). The printed **median** is over those per-step maxima (warmup step excluded when present).
+- **`nvidia-smi` GPU utilization** and **`dmon` SM efficiency:** **sampled on rank 0 only** (avoids an all-gather of NVML samples every step).
+- **MFU:** **computed on rank 0** from estimated model FLOPs and global throughput (throughput already reflects the cross-rank **max** step time); it is not an average of per-GPU MFU.
+
+**Caveats:**
+
+- For judging this stack, treat **step time**, **cells/s**, and **MFU** as the main signal—they already encode steady-state training cost once the first steps settle.
+- On a longer run, one-time costs (graph/JIT compile, allocator warmup, loader ramp-up) amortize: wall time per step trends toward the steady median you see after warmup, and the job-level time dominated by startup/teardown (Modal, queue workers, process group setup) shrinks as a fraction of total time.
+- Don't expect `nvidia-smi` util or rank-0 `dmon` SM% to become perfect proxies for “cluster efficiency”. They still mix **idle gaps between kernels** (Python, NCCL, sync) with compute on one GPU, so use them alongside step-time/MFU, or profile with a proper tool if you need duty-cycle truth on every device.
+
+### `scgpt` (51,061,760 parameters) on 1× NVIDIA H200 (Modal)
+
+Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **Flash Attention 4**, **`--no-use-compile`**, **50 steps**, **128 cells/step** (effective batch **128**), **max genes 512**.
+
+**Breakdown of time within traming step (steady state)** — With **`profile=True`** in `train()` (see `modal_train.py`), logs include chunks measured inside `train_step()` (CUDA-synchronized intervals; see `fast_scgpt/train.py`). Below is a representative step.
+
+| Phase | Time (ms) | What it measures |
+|-------|-----------|------------------|
+| **`dl`** | **0** | Host time blocked on `next(batch_iter)` until the batch is produced. **~0 ms** here means the iterator returns immediately: **prefetch / overlap** is feeding the GPU without stalling this timer. |
+| **`data`** | **1** | `input_ids` / `attention_mask` **host to device** copy. |
+| **`mask`** | **1** | **Masked-language-model masking setup** (`create_mask`: which gene/expression tokens to predict and the corresponding targets/masks). |
+| **`fwd`** | **112** | **Forward + loss** (`model.compute_loss` under autocast). |
+| **`bwd`** | **202** | **Backward** (`loss.backward`). |
+| **`opt`** | **3** | **Optimizer** (`step`, `zero_grad`; scaler update when AMP is on). |
+
+| Metric | Value |
+|--------|--------|
+| **Median step time** | **323.3 ms** (summary excludes first-batch warmup) |
+| **Avg step time** | **344.2 ms** |
+| **Training throughput** | **396 cells/s** |
+| **Steps/s** | **3.09** |
+| **Peak GPU memory** | **67.92 GB** (**45%** of GPU in this allocation) |
+| **MFU** | **23.71%** |
+| **Achieved TFLOPS** | **74.0** (single device) |
+| **`nvidia-smi` GPU util** | **84.9%** |
+| **SM efficiency (`dmon`)** | **45.8%** |
+
+
+**Util / SM%:** On this single-GPU trace, **`nvidia-smi` / `dmon`** sample the only training device for the whole job—usually easier to interpret than the short 8-GPU run’s rank-0-only hardware sample.
 
 ## Contributing
 
