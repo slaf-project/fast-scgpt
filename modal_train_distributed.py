@@ -61,7 +61,7 @@ _distributed_base = (
         "libnl-route-3-200",
     )
     .uv_pip_install(
-        "torch>=2.4.0,<2.5.0",
+        "torch>=2.4.0",
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",
@@ -72,7 +72,7 @@ _distributed_base = (
         "packaging",
         "ninja",
         "modal",
-        "slafdb",
+        "slafdb[ml]",
     )
 )
 

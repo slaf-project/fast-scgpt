@@ -44,7 +44,7 @@ _base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .uv_pip_install(
-        "torch>=2.4.0,<2.5.0",
+        "torch>=2.4.0",
         "einops>=0.7",
         "numpy>=1.24",
         "loguru>=0.7",
@@ -54,7 +54,7 @@ _base_image = (
         "s3fs>=2024.2",
         "packaging",
         "ninja",
-        "slafdb",
+        "slafdb[ml]",
     )
 )
 
