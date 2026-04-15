@@ -102,8 +102,8 @@ Representative **Modal** distributed run via `modal_train_distributed.py`:
 
 - **Attention:** Flash Attention 4
 - **Run length:** 50 steps (short benchmark; see note below on longer jobs)
-- **Batch:** 128 cells per GPU per step → **effective global batch 1024**
-- **Sequence:** max genes **512**
+- **Batch:** 240 cells per GPU per step → **effective global batch 1920**
+- **Sequence:** max genes **1024**
 - **Data:** Tahoe-100M, streamed into Modal from **S3** through the distributed dataloader with **2 CPU** prefetch workers
 
 **Command** (from repo root; requires Modal + `s3-credentials` and the SLAF distributed dataloader deploy as in `modal_train_distributed.py`):
@@ -112,8 +112,8 @@ Representative **Modal** distributed run via `modal_train_distributed.py`:
 modal run modal_train_distributed.py \
   --model-size scgpt \
   --n-steps 50 \
-  --batch-size 128 \
-  --max-genes 512 \
+  --batch-size 240 \
+  --max-genes 1024 \
   --data-source s3 \
   --flash-attn-backend fa4 \
   --sparse-gene-head \
@@ -122,13 +122,15 @@ modal run modal_train_distributed.py \
 
 | Metric | Value |
 |--------|--------|
-| **Median step time** | **56 ms** (steady state; sub-100 ms per step at 128 cells/GPU) |
-| **Global throughput** | **~18.3k cells/s** |
-| **Steps/s** | **~18** |
-| **Training compute (50 steps)** | **~23.5 s** wall time (end-to-end job ~95 s including startup/teardown) |
-| **Peak GPU memory** | **~71.7 GB / GPU** (~84%) |
-| **MFU** | **~17.3%** |
-| **Achieved TFLOPS** | **~1370 total** (~171 per GPU) |
+| **Median step time** | **60 ms** (steady state; sub-100 ms per step at 128 cells/GPU) |
+| **Global throughput** | **~31.9k cells/s** |
+| **Steps/s** | **~16.6** |
+| **Training compute (50 steps)** | **~24.1 s** wall time (end-to-end job ~98 s including startup/teardown) |
+| **Peak GPU memory** | **~80.3 GB / GPU** (~94%) |
+| **MFU** | **~31.6%** |
+| **GPU utilization (nvidia-smi)** | **60.0%** |
+| **SM efficiency (dmon)** | **6.1%** |
+| **Achieved TFLOPS** | **~2500 total** (~312 per GPU) |
 
 **How these numbers are defined (8-GPU run)** — implementation detail in `fast_scgpt/train_ddp.py`:
 
@@ -142,9 +144,9 @@ modal run modal_train_distributed.py \
 - On a longer run, one-time costs (graph/JIT compile, allocator warmup, loader ramp-up) amortize: wall time per step trends toward the steady median you see after warmup, and the job-level time dominated by startup/teardown (Modal, queue workers, process group setup) shrinks as a fraction of total time.
 - Don't expect `nvidia-smi` util or rank-0 `dmon` SM% to become perfect proxies for “cluster efficiency”. They still mix **idle gaps between kernels** (Python, NCCL, sync) with compute on one GPU, so use them alongside step-time/MFU, or profile with a proper tool if you need duty-cycle truth on every device.
 
-### `scgpt` (51,061,760 parameters) on 1× NVIDIA H200 (Modal)
+### `scgpt` (51,061,760 parameters) on 1× NVIDIA H100 (Modal)
 
-Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **Flash Attention 4**, **`--no-use-compile`**, **`--sparse-gene-head`**, **`--profile`** (step timing breakdown), **50 steps**, **128 cells/step** (effective batch **128**), **max genes 512**, **S3** data source.
+Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **Flash Attention 4**, **`--no-use-compile`**, **`--sparse-gene-head`**, **`--profile`** (step timing breakdown), **50 steps**, **240 cells/step** (effective batch **240**), **max genes 1024**, **S3** data source.
 
 **Command** (from repo root):
 
@@ -152,8 +154,8 @@ Representative **`modal_train.py`** run (single-process `fast_scgpt.train`). **F
 modal run modal_train.py \
   --model-size scgpt \
   --n-steps 50 \
-  --batch-size 128 \
-  --max-genes 512 \
+  --batch-size 240 \
+  --max-genes 1024 \
   --data-source s3 \
   --flash-attn-backend fa4 \
   --profile \
@@ -168,21 +170,20 @@ modal run modal_train.py \
 | **`dl`** | **0** | Host time blocked on `next(batch_iter)` until the batch is produced. **~0 ms** here means the iterator returns immediately: **prefetch / overlap** is feeding the GPU without stalling this timer. |
 | **`data`** | **1** | `input_ids` / `attention_mask` **host to device** copy. |
 | **`mask`** | **1** | **Masked-language-model masking setup** (`create_mask`: which gene/expression tokens to predict and the corresponding targets/masks). |
-| **`fwd`** | **112** | **Forward + loss** (`model.compute_loss` under autocast). |
-| **`bwd`** | **202** | **Backward** (`loss.backward`). |
-| **`opt`** | **3** | **Optimizer** (`step`, `zero_grad`; scaler update when AMP is on). |
+| **`fwd`** | **102** | **Forward + loss** (`model.compute_loss` under autocast). |
+| **`bwd`** | **179** | **Backward** (`loss.backward`). |
+| **`opt`** | **1** | **Optimizer** (`step`, `zero_grad`; scaler update when AMP is on). |
 
 | Metric | Value |
 |--------|--------|
-| **Median step time** | **323.3 ms** (summary excludes first-batch warmup) |
-| **Avg step time** | **344.2 ms** |
-| **Training throughput** | **396 cells/s** |
-| **Steps/s** | **3.09** |
-| **Peak GPU memory** | **67.92 GB** (**45%** of GPU in this allocation) |
-| **MFU** | **23.71%** |
-| **Achieved TFLOPS** | **74.0** (single device) |
-| **`nvidia-smi` GPU util** | **84.9%** |
-| **SM efficiency (`dmon`)** | **45.8%** |
-
+| **Median step time** | **284.9 ms** (summary excludes first-batch warmup) |
+| **Avg step time** | **294.1 ms** |
+| **Training throughput** | **842 cells/s** |
+| **Steps/s** | **3.51** |
+| **Peak GPU memory** | **74.54 GB** (**88%** of GPU in this allocation) |
+| **MFU** | **37.21%** |
+| **GPU utilization (nvidia-smi)** | **25.0%** |
+| **SM efficiency (dmon)** | **20.5%** |
+| **Achieved TFLOPS** | **368.0** (single device) |
 
 **Util / SM%:** On this single-GPU trace, **`nvidia-smi` / `dmon`** sample the only training device for the whole job—usually easier to interpret than the short 8-GPU run’s rank-0-only hardware sample.
