@@ -66,6 +66,30 @@ def _close_distributed_dataloader_iter(iterator: object | None) -> None:
         )
 
 
+def _validate_dual_stream_batch_shapes(
+    batch: dict[str, torch.Tensor],
+) -> None:
+    """Fail fast if distributed batch violates canonical scGPT dual-stream contract."""
+    if "values" not in batch:
+        raise ValueError(
+            "Distributed scGPT batch missing required 'values' tensor "
+            "(dual-stream contract: input_ids + values + attention_mask)."
+        )
+    input_ids = batch["input_ids"]
+    values = batch["values"]
+    attention_mask = batch["attention_mask"]
+    if values.shape != input_ids.shape:
+        raise ValueError(
+            "Distributed scGPT dual-stream contract violated: values and input_ids "
+            f"shapes differ ({tuple(values.shape)} vs {tuple(input_ids.shape)})."
+        )
+    if values.shape != attention_mask.shape:
+        raise ValueError(
+            "Distributed scGPT dual-stream contract violated: values and attention_mask "
+            f"shapes differ ({tuple(values.shape)} vs {tuple(attention_mask.shape)})."
+        )
+
+
 @dataclass
 class DistributedMetrics:
     """Metrics for distributed training."""
@@ -300,6 +324,7 @@ def train_ddp(
     config.vocab_size = vocab_size
     config._expr_token_offset = vocab_size
     config._total_vocab_size = vocab_size + config.n_expression_bins
+    config.max_seq_len = max_genes + 2
 
     if is_main:
         logger.info(f"vocab_size={vocab_size}, total={config.total_vocab_size}")
@@ -415,8 +440,14 @@ def train_ddp(
 
         # Move batch to device (each rank has its own batch from the queue)
         input_ids = batch_cpu["input_ids"].to(device, non_blocking=True)
+        values = batch_cpu["values"].to(device, non_blocking=True)
         attention_mask = batch_cpu["attention_mask"].to(device, non_blocking=True)
-        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+        batch = {
+            "input_ids": input_ids,
+            "values": values,
+            "attention_mask": attention_mask,
+        }
+        _validate_dual_stream_batch_shapes(batch)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -431,24 +462,30 @@ def train_ddp(
         # Forward pass
         model.train()
         input_ids = batch["input_ids"]
+        values = batch["values"]
         attention_mask = batch["attention_mask"]
 
-        input_ids = clip_expression_tokens(
-            input_ids, config.vocab_size, config.n_expression_bins
+        values = clip_expression_tokens(
+            values, config.vocab_size, config.n_expression_bins
         )
 
         if profile and device.type == "cuda":
             torch.cuda.synchronize(device)
         t_after_clip = time.perf_counter()
 
-        masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
-            input_ids,
-            attention_mask,
-            mask_token_id=config.mask_token_id,
-            gene_token_offset=config.gene_token_offset,
-            vocab_size=config.vocab_size,
-            expr_token_offset=config.expr_token_offset,
-            mask_ratio=0.15,
+        masked_input_ids, masked_values, gene_targets, expr_targets, gene_mask = (
+            create_mask(
+                input_ids,
+                values,
+                attention_mask,
+                mask_token_id=config.mask_token_id,
+                pad_token_id=config.pad_token_id,
+                gene_token_offset=config.gene_token_offset,
+                vocab_size=config.vocab_size,
+                expr_token_offset=config.expr_token_offset,
+                n_expression_bins=config.n_expression_bins,
+                mask_ratio=0.15,
+            )
         )
 
         if profile and device.type == "cuda":
@@ -458,6 +495,7 @@ def train_ddp(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(
                 masked_input_ids,
+                masked_values,
                 attention_mask,
                 skip_gene_logits=config.sparse_gene_head,
             )
@@ -480,12 +518,8 @@ def train_ddp(
                     gene_targets[gene_mask],
                     ignore_index=-100,
                 )
-            expr_mask = torch.zeros_like(gene_mask)
-            expr_mask[:, 1:] = gene_mask[:, :-1]
-            valid_gene_mask = gene_mask.clone()
-            valid_gene_mask[:, -1] = False
             expr_loss = torch.nn.functional.cross_entropy(
-                expr_logits[expr_mask], expr_targets[valid_gene_mask], ignore_index=-100
+                expr_logits[gene_mask], expr_targets[gene_mask], ignore_index=-100
             )
             loss = (gene_loss + expr_loss) / gradient_accumulation_steps
 

@@ -137,54 +137,62 @@ def reset_cuda_stats(device: torch.device) -> None:
 
 def create_mask(
     input_ids: torch.Tensor,
+    values: torch.Tensor,
     attention_mask: torch.Tensor,
     mask_token_id: int = 3,
+    pad_token_id: int = 0,
     gene_token_offset: int = 4,
     vocab_size: int = 50000,
     expr_token_offset: int = 50000,
+    n_expression_bins: int = 200,
     mask_ratio: float = 0.15,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create random masking for masked gene prediction.
 
-    For scGPT format: [CLS] gene1 expr1 gene2 expr2 ... [SEP]
-    We mask at gene positions (odd indices after CLS: 1, 3, 5, ...)
-    and also mask the corresponding expression (even indices: 2, 4, 6, ...)
+    For canonical dual-stream scGPT format:
+    - input_ids: [CLS] gene1 gene2 ... [SEP]
+    - values:    [PAD] expr1 expr2 ... [PAD]
 
     Args:
         input_ids: Token IDs (batch, seq_len)
+        values: Expression/value token IDs aligned with input_ids (batch, seq_len)
         attention_mask: Attention mask (batch, seq_len)
         mask_token_id: Token ID for [MASK]
+        pad_token_id: Token ID for [PAD]
         gene_token_offset: Offset where gene tokens start
         vocab_size: Size of gene vocabulary (expression bins start after this)
         mask_ratio: Fraction of genes to mask
 
     Returns:
         Tuple of:
-        - masked_input_ids: Input with masked tokens replaced
+        - masked_input_ids: Gene input with masked tokens replaced
+        - masked_values: Value stream with masked positions replaced by PAD
         - gene_targets: Target gene IDs (-100 for non-masked positions)
         - expr_targets: Target expression bins (-100 for non-masked positions)
         - gene_mask: Boolean mask for gene positions that were masked
     """
-    batch_size, seq_len = input_ids.shape
-    device = input_ids.device
+    if input_ids.shape != values.shape:
+        raise ValueError(
+            "Dual-stream contract violated: input_ids and values shape mismatch, got "
+            f"{tuple(input_ids.shape)} vs {tuple(values.shape)}"
+        )
+    if input_ids.shape != attention_mask.shape:
+        raise ValueError(
+            "Dual-stream contract violated: input_ids and attention_mask shape mismatch, got "
+            f"{tuple(input_ids.shape)} vs {tuple(attention_mask.shape)}"
+        )
 
     # Copy input for masking
     masked_input_ids = input_ids.clone()
+    masked_values = values.clone()
 
     # Initialize targets with -100 (ignore in loss)
     gene_targets = torch.full_like(input_ids, -100)
     expr_targets = torch.full_like(input_ids, -100)
 
-    # Identify gene positions (odd positions after CLS, which is position 0)
-    # In scGPT format: pos 1, 3, 5, ... are genes; pos 2, 4, 6, ... are expressions
-    position_indices = torch.arange(seq_len, device=device)
-    is_gene_position = (position_indices % 2 == 1) & (position_indices > 0)
-
-    # Also need to check that it's a valid gene token (not padding/special)
+    # Canonical scGPT: genes live directly in input_ids stream.
     is_gene_token = (input_ids >= gene_token_offset) & (input_ids < vocab_size)
-
-    # Combine: gene position AND gene token AND not padding
-    can_mask = is_gene_position.unsqueeze(0) & is_gene_token & attention_mask
+    can_mask = is_gene_token & attention_mask
 
     # Random mask selection
     rand = torch.rand_like(input_ids, dtype=torch.float)
@@ -193,32 +201,19 @@ def create_mask(
     # Store targets before masking
     gene_targets[mask_positions] = input_ids[mask_positions]
 
-    # Get corresponding expression targets (vectorized)
-    # For masked gene at position p, expression is at p+1
-    # We need to exclude genes at last position (no room for expression)
-    valid_gene_mask = mask_positions.clone()
-    valid_gene_mask[:, -1] = False  # Genes at last pos have no expr slot
-
-    # Shift input_ids left by 1 to align expression tokens with gene positions
-    # So expr_at_gene_pos[p] = input_ids[p+1]
-    expr_at_gene_pos = torch.zeros_like(input_ids)
-    expr_at_gene_pos[:, :-1] = input_ids[:, 1:]
-
-    # Extract expression bin targets (token - offset)
-    expr_bin_ids = expr_at_gene_pos - expr_token_offset
-    expr_targets[valid_gene_mask] = expr_bin_ids[valid_gene_mask]
+    # Targets come from aligned values stream at the same masked positions.
+    expr_bin_ids = values - expr_token_offset
+    valid_expr = (expr_bin_ids >= 0) & (expr_bin_ids < n_expression_bins)
+    expr_targets[mask_positions & valid_expr] = expr_bin_ids[
+        mask_positions & valid_expr
+    ]
 
     # Apply masking to input
-    # For genes: replace with [MASK]
     masked_input_ids[mask_positions] = mask_token_id
+    # Hide expression signal for masked genes to avoid leakage.
+    masked_values[mask_positions] = pad_token_id
 
-    # For expressions at gene_pos+1: also replace with [MASK]
-    # Shift mask right to get expression positions
-    expr_mask_positions = torch.zeros_like(mask_positions)
-    expr_mask_positions[:, 1:] = valid_gene_mask[:, :-1]
-    masked_input_ids[expr_mask_positions] = mask_token_id
-
-    return masked_input_ids, gene_targets, expr_targets, mask_positions
+    return masked_input_ids, masked_values, gene_targets, expr_targets, mask_positions
 
 
 def clip_expression_tokens(
@@ -307,11 +302,12 @@ def train_step(
         # Move batch to device (non_blocking matches train_ddp; best with pinned CPU tensors)
         _nb = device.type == "cuda"
         input_ids = batch["input_ids"].to(device, non_blocking=_nb)
+        values = batch["values"].to(device, non_blocking=_nb)
         attention_mask = batch["attention_mask"].to(device, non_blocking=_nb)
 
-        # Clip expression tokens to valid range (workaround for SLAF tokenizer bug)
-        input_ids = clip_expression_tokens(
-            input_ids, config.vocab_size, config.n_expression_bins
+        # Clip value tokens to valid expression range (defensive guard for tokenizer bugs).
+        values = clip_expression_tokens(
+            values, config.vocab_size, config.n_expression_bins
         )
 
     if profile and device.type == "cuda":
@@ -320,14 +316,19 @@ def train_step(
 
     with _torch_prof_region("scgpt.mask"):
         # Create masking
-        masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
-            input_ids,
-            attention_mask,
-            mask_token_id=config.mask_token_id,
-            gene_token_offset=config.gene_token_offset,
-            vocab_size=config.vocab_size,
-            expr_token_offset=config.expr_token_offset,
-            mask_ratio=0.15,
+        masked_input_ids, masked_values, gene_targets, expr_targets, gene_mask = (
+            create_mask(
+                input_ids,
+                values,
+                attention_mask,
+                mask_token_id=config.mask_token_id,
+                pad_token_id=config.pad_token_id,
+                gene_token_offset=config.gene_token_offset,
+                vocab_size=config.vocab_size,
+                expr_token_offset=config.expr_token_offset,
+                n_expression_bins=config.n_expression_bins,
+                mask_ratio=0.15,
+            )
         )
 
     if profile and device.type == "cuda":
@@ -348,6 +349,7 @@ def train_step(
         ):
             loss_dict = model.compute_loss(
                 masked_input_ids,
+                masked_values,
                 attention_mask,
                 gene_targets,
                 expr_targets,
@@ -505,6 +507,8 @@ def train(
     # Recompute derived fields
     config._expr_token_offset = vocab_size
     config._total_vocab_size = vocab_size + config.n_expression_bins
+    # Keep config metadata aligned with runtime tokenizer setting.
+    config.max_seq_len = max_genes + 2
     logger.info(
         "SLAF num_genes={}, vocab_size={}, total_vocab_size={}",
         num_genes,
@@ -580,8 +584,8 @@ def train(
     )
     logger.info("SLAFDataLoader created in {:.2f}s", time.time() - t0)
 
-    # Sequence length: CLS + (gene + expr) * max_genes + SEP
-    seq_len = 2 + max_genes * 2
+    # Sequence length (dual stream): CLS + max_genes + SEP
+    seq_len = max_genes + 2
 
     # Initialize GPU metrics tracking
     metrics = GPUMetrics()
@@ -744,18 +748,15 @@ def train(
                     max_token,
                     config.total_vocab_size,
                 )
-            # Debug: check what's in gene vs expression positions
-            # scGPT format: [CLS] gene1 expr1 gene2 expr2 ... [SEP]
-            # Gene positions: 1, 3, 5, ... (odd after CLS)
-            # Expr positions: 2, 4, 6, ... (even after CLS)
-            sample = input_ids[0]  # First sample
-            gene_positions = sample[1::2][:10]  # First 10 gene tokens
-            expr_positions = sample[2::2][:10]  # First 10 expr tokens
+            # Debug: dual stream values are aligned at identical positions.
+            values = batch["values"]
+            sample_genes = input_ids[0, 1:11]
+            sample_values = values[0, 1:11]
             logger.info(
-                "Sample gene tokens (pos 1,3,5...): {}", gene_positions.tolist()
+                "Sample gene tokens (aligned stream): {}", sample_genes.tolist()
             )
             logger.info(
-                "Sample expr tokens (pos 2,4,6...): {}", expr_positions.tolist()
+                "Sample value tokens (aligned stream): {}", sample_values.tolist()
             )
             logger.info(
                 "Config vocab_size={}, n_expression_bins={}",

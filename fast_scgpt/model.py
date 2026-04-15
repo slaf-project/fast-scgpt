@@ -276,11 +276,12 @@ class TransformerBlock(nn.Module):
 class ScGPT(nn.Module):
     """ScGPT model for single-cell gene expression modeling.
 
-    Architecture follows scGPT paper with interleaved gene-expression format:
-    [CLS] gene1 expr1 gene2 expr2 ... [SEP] [PAD]
+    Architecture follows canonical scGPT dual-stream format:
+    - ``input_ids``: gene IDs + special tokens
+    - ``values``: aligned expression/value tokens
 
-    The model uses a shared embedding for both gene tokens and expression bins,
-    summing them at each position to create the input representation.
+    The model uses a shared token embedding table for both streams and sums
+    the gene/value embeddings position-wise to create the input representation.
 
     Supports gradient checkpointing for memory-efficient training.
     """
@@ -347,6 +348,7 @@ class ScGPT(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        values: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         *,
         skip_gene_logits: bool = False,
@@ -354,8 +356,8 @@ class ScGPT(nn.Module):
         """Forward pass through the model.
 
         Args:
-            input_ids: Token IDs of shape (batch, seq_len).
-                Format: [CLS] gene1 expr1 gene2 expr2 ... [SEP] [PAD]
+            input_ids: Gene token IDs of shape (batch, seq_len).
+            values: Expression/value token IDs aligned to ``input_ids``.
             attention_mask: Boolean mask of shape (batch, seq_len).
                 True for real tokens, False for padding.
             skip_gene_logits: If True, skip the gene output projection (avoids the full
@@ -370,8 +372,13 @@ class ScGPT(nn.Module):
                 - expr_logits: Logits for expression prediction (batch, seq_len, n_bins)
                 - hidden_states: Final hidden states (batch, seq_len, d_model)
         """
+        if values.shape != input_ids.shape:
+            raise ValueError(
+                "Dual-stream contract violated: values and input_ids shapes differ "
+                f"({tuple(values.shape)} vs {tuple(input_ids.shape)})"
+            )
         with _prof_region("scgpt.embed"):
-            x = self.embedding(input_ids)
+            x = self.embedding(input_ids) + self.embedding(values)
 
         with _prof_region("scgpt.blocks"):
             for block in self.blocks:
@@ -405,6 +412,7 @@ class ScGPT(nn.Module):
     def compute_loss(
         self,
         input_ids: torch.Tensor,
+        values: torch.Tensor,
         attention_mask: torch.Tensor,
         gene_targets: torch.Tensor,
         expr_targets: torch.Tensor,
@@ -413,7 +421,8 @@ class ScGPT(nn.Module):
         """Compute masked prediction loss.
 
         Args:
-            input_ids: Input token IDs (batch, seq_len)
+            input_ids: Input gene token IDs (batch, seq_len)
+            values: Input value token IDs (batch, seq_len)
             attention_mask: Attention mask (batch, seq_len)
             gene_targets: Target gene IDs at masked positions (batch, seq_len)
             expr_targets: Target expression bins at masked positions (batch, seq_len)
@@ -428,6 +437,7 @@ class ScGPT(nn.Module):
         """
         outputs = self.forward(
             input_ids,
+            values,
             attention_mask,
             skip_gene_logits=self.config.sparse_gene_head,
         )
@@ -455,25 +465,12 @@ class ScGPT(nn.Module):
                     ignore_index=-100,
                 )
 
-        # Expression loss: predict expression at expr position (gene_pos + 1)
-        # But expr_targets are stored at gene_mask positions for simplicity
+        # Expression loss: predict aligned values at the same masked gene positions.
         expr_logits = outputs["expr_logits"]
-
-        # Get expression predictions at position gene_pos + 1
-        # Shift gene_mask right by 1 to get expression positions
-        expr_mask = torch.zeros_like(gene_mask)
-        expr_mask[:, 1:] = gene_mask[:, :-1]
-
-        # Also need a gene_mask that excludes genes at the last position
-        # (those don't have valid expression positions)
-        valid_gene_mask = gene_mask.clone()
-        valid_gene_mask[:, -1] = False  # Genes at last position have no expr slot
-
-        # Get targets and logits - targets at gene positions, logits at expr positions
         with _prof_region("scgpt.expr_ce"):
             expr_loss = F.cross_entropy(
-                expr_logits[expr_mask],
-                expr_targets[valid_gene_mask],
+                expr_logits[gene_mask],
+                expr_targets[gene_mask],
                 ignore_index=-100,
             )
 

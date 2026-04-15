@@ -155,13 +155,19 @@ class TestScGPT:
         batch_size = 2
         seq_len = 100
         input_ids = torch.randint(
-            0, config.total_vocab_size, (batch_size, seq_len), device=device
+            0, config.vocab_size, (batch_size, seq_len), device=device
+        )
+        values = torch.randint(
+            config.expr_token_offset,
+            config.expr_token_offset + config.n_expression_bins,
+            (batch_size, seq_len),
+            device=device,
         )
         attention_mask = torch.ones(
             batch_size, seq_len, dtype=torch.bool, device=device
         )
 
-        outputs = model(input_ids, attention_mask)
+        outputs = model(input_ids, values, attention_mask)
 
         assert "gene_logits" in outputs
         assert "expr_logits" in outputs
@@ -188,13 +194,19 @@ class TestScGPT:
         batch_size = 2
         seq_len = 100
         input_ids = torch.randint(
-            0, config.total_vocab_size, (batch_size, seq_len), device=device
+            0, config.vocab_size, (batch_size, seq_len), device=device
+        )
+        values = torch.randint(
+            config.expr_token_offset,
+            config.expr_token_offset + config.n_expression_bins,
+            (batch_size, seq_len),
+            device=device,
         )
         attention_mask = torch.ones(
             batch_size, seq_len, dtype=torch.bool, device=device
         )
 
-        outputs = model(input_ids, attention_mask)
+        outputs = model(input_ids, values, attention_mask)
         # Use both gene and expr outputs to ensure all heads get gradients
         loss = outputs["gene_logits"].sum() + outputs["expr_logits"].sum()
         loss.backward()
@@ -238,22 +250,34 @@ class TestScGPT:
             (batch_size, seq_len),
             device=device,
         )
+        values = torch.randint(
+            config.expr_token_offset,
+            config.expr_token_offset + config.n_expression_bins,
+            (batch_size, seq_len),
+            device=device,
+        )
         attention_mask = torch.ones(
             batch_size, seq_len, dtype=torch.bool, device=device
         )
 
-        masked_input_ids, gene_targets, expr_targets, gene_mask = create_mask(
-            input_ids,
-            attention_mask,
-            mask_token_id=config.mask_token_id,
-            gene_token_offset=config.gene_token_offset,
-            vocab_size=config.vocab_size,
-            expr_token_offset=config.expr_token_offset,
-            mask_ratio=0.15,
+        masked_input_ids, masked_values, gene_targets, expr_targets, gene_mask = (
+            create_mask(
+                input_ids,
+                values,
+                attention_mask,
+                mask_token_id=config.mask_token_id,
+                pad_token_id=config.pad_token_id,
+                gene_token_offset=config.gene_token_offset,
+                vocab_size=config.vocab_size,
+                expr_token_offset=config.expr_token_offset,
+                n_expression_bins=config.n_expression_bins,
+                mask_ratio=0.15,
+            )
         )
 
         d = dense_m.compute_loss(
             masked_input_ids,
+            masked_values,
             attention_mask,
             gene_targets,
             expr_targets,
@@ -261,6 +285,7 @@ class TestScGPT:
         )
         s = sparse_m.compute_loss(
             masked_input_ids,
+            masked_values,
             attention_mask,
             gene_targets,
             expr_targets,
@@ -278,12 +303,18 @@ class TestScGPT:
         model = ScGPT(cfg).to(device)
         batch_size, seq_len = 2, 32
         input_ids = torch.randint(
-            0, config.total_vocab_size, (batch_size, seq_len), device=device
+            0, config.vocab_size, (batch_size, seq_len), device=device
+        )
+        values = torch.randint(
+            config.expr_token_offset,
+            config.expr_token_offset + config.n_expression_bins,
+            (batch_size, seq_len),
+            device=device,
         )
         attention_mask = torch.ones(
             batch_size, seq_len, dtype=torch.bool, device=device
         )
-        out = model(input_ids, attention_mask, skip_gene_logits=True)
+        out = model(input_ids, values, attention_mask, skip_gene_logits=True)
         assert "gene_logits" not in out
         assert out["expr_logits"].shape == (
             batch_size,
@@ -301,28 +332,38 @@ class TestTrainMasking:
 
         batch_size = 2
         seq_len = 100
-        # Create input in scGPT format: [CLS] gene1 expr1 gene2 expr2 ... [SEP]
+        # Create dual-stream input: aligned genes + values.
         input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+        values = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
         input_ids[:, 0] = config.cls_token_id
-        # Fill gene positions (1, 3, 5, ...) with gene tokens
-        for i in range(1, seq_len - 1, 2):
+        for i in range(1, seq_len - 1):
             input_ids[:, i] = config.gene_token_offset + i
-        # Fill expression positions (2, 4, 6, ...) with expression tokens
-        for i in range(2, seq_len, 2):
-            input_ids[:, i] = config.vocab_size + 1  # Expression bin 1
+            values[:, i] = config.expr_token_offset + 1  # Expression bin 1
         input_ids[:, -1] = config.sep_token_id
 
         attention_mask = torch.ones(
             batch_size, seq_len, dtype=torch.bool, device=device
         )
 
-        masked_ids, gene_targets, expr_targets, gene_mask = create_mask(
-            input_ids, attention_mask, mask_ratio=0.3
+        masked_ids, masked_values, gene_targets, expr_targets, gene_mask = create_mask(
+            input_ids,
+            values,
+            attention_mask,
+            mask_token_id=config.mask_token_id,
+            pad_token_id=config.pad_token_id,
+            gene_token_offset=config.gene_token_offset,
+            vocab_size=config.vocab_size,
+            expr_token_offset=config.expr_token_offset,
+            n_expression_bins=config.n_expression_bins,
+            mask_ratio=0.3,
         )
 
         # Check that some positions were masked
         assert gene_mask.any()
         # Check that masked positions have mask token
         assert (masked_ids[gene_mask] == config.mask_token_id).all()
+        # Check masked value positions are hidden
+        assert (masked_values[gene_mask] == config.pad_token_id).all()
         # Check that targets are set for masked positions
         assert (gene_targets[gene_mask] != -100).all()
+        assert (expr_targets[gene_mask] != -100).all()

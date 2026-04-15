@@ -17,7 +17,7 @@ class ModelConfig:
         d_ff: Feed-forward hidden dimension. Defaults to 4 * d_model.
         vocab_size: Gene vocabulary size (includes special tokens).
         n_expression_bins: Number of expression level bins for discretization.
-        max_seq_len: Maximum sequence length (2 * max_genes + 2 for scGPT format).
+        max_seq_len: Maximum sequence length (max_genes + 2 for dual-stream scGPT).
         dropout: Dropout probability.
         bias: Whether to use bias in linear layers.
     """
@@ -35,7 +35,7 @@ class ModelConfig:
     # Adding buffer for safety (SLAF may have additional tokens)
     vocab_size: int = 62714  # 4 special + 62710 genes
     n_expression_bins: int = 200  # Extra headroom (SLAF uses up to ~150)
-    max_seq_len: int = 2050  # 2 * 1024 + 2 (CLS + SEP)
+    max_seq_len: int = 1026  # 1024 + 2 (CLS + SEP)
 
     # Regularization
     dropout: float = 0.1

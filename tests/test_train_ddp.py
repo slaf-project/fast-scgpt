@@ -1,6 +1,12 @@
 """Tests for train_ddp helpers (e.g. producer worker shutdown)."""
 
-from fast_scgpt.train_ddp import _stop_producer_workers
+import pytest
+import torch
+
+from fast_scgpt.train_ddp import (
+    _stop_producer_workers,
+    _validate_dual_stream_batch_shapes,
+)
 
 
 class TestStopProducerWorkers:
@@ -44,3 +50,41 @@ class TestStopProducerWorkers:
         loader = LoaderRaises()
         # Should not raise; exception is logged inside the function
         _stop_producer_workers(loader)
+
+
+class TestDualStreamBatchContract:
+    """Fast fail tests for distributed scGPT batch shape contract."""
+
+    def test_missing_values_raises(self) -> None:
+        batch = {
+            "input_ids": torch.zeros((2, 8), dtype=torch.long),
+            "attention_mask": torch.ones((2, 8), dtype=torch.bool),
+        }
+        with pytest.raises(ValueError, match="missing required 'values'"):
+            _validate_dual_stream_batch_shapes(batch)
+
+    def test_values_input_ids_shape_mismatch_raises(self) -> None:
+        batch = {
+            "input_ids": torch.zeros((2, 8), dtype=torch.long),
+            "values": torch.zeros((2, 7), dtype=torch.long),
+            "attention_mask": torch.ones((2, 8), dtype=torch.bool),
+        }
+        with pytest.raises(ValueError, match="values and input_ids"):
+            _validate_dual_stream_batch_shapes(batch)
+
+    def test_values_attention_mask_shape_mismatch_raises(self) -> None:
+        batch = {
+            "input_ids": torch.zeros((2, 8), dtype=torch.long),
+            "values": torch.zeros((2, 8), dtype=torch.long),
+            "attention_mask": torch.ones((2, 7), dtype=torch.bool),
+        }
+        with pytest.raises(ValueError, match="values and attention_mask"):
+            _validate_dual_stream_batch_shapes(batch)
+
+    def test_aligned_shapes_pass(self) -> None:
+        batch = {
+            "input_ids": torch.zeros((2, 8), dtype=torch.long),
+            "values": torch.zeros((2, 8), dtype=torch.long),
+            "attention_mask": torch.ones((2, 8), dtype=torch.bool),
+        }
+        _validate_dual_stream_batch_shapes(batch)

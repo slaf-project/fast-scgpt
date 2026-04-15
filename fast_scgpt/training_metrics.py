@@ -80,8 +80,8 @@ def compute_training_metrics(summary: dict) -> dict:
     if elapsed <= 0 or n_steps <= 0:
         return {}
 
-    # Sequence length: scGPT uses 2 * max_genes + 2 (CLS, SEP, gene/expr pairs)
-    seq_len = 2 * max_genes + 2
+    # Sequence length: dual-stream scGPT uses max_genes + 2 (CLS + SEP).
+    seq_len = max_genes + 2
     param_count = get_param_count(model_size)
     flops_per_step = flops_per_step_theoretical(param_count, seq_len, effective_batch)
     total_flops = flops_per_step * n_steps
