@@ -191,7 +191,7 @@ def is_hopper_gpu() -> bool:
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major >= 9
+    return bool(props.major >= 9)
 
 
 def check_flash_attn() -> bool:
