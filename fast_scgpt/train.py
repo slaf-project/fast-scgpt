@@ -254,6 +254,32 @@ def clip_expression_tokens(
     return clipped
 
 
+def offset_expression_bins(
+    values: torch.Tensor,
+    input_ids: torch.Tensor,
+    vocab_size: int,
+    n_expression_bins: int,
+    gene_token_offset: int = 4,
+) -> torch.Tensor:
+    """Convert raw expression-bin IDs to shared-vocab expression token IDs.
+
+    Newer SLAF scGPT tokenizers return a dual stream where ``values`` contains
+    raw bin IDs at gene positions. fast-scGPT embeds both streams in one shared
+    table, so expression bins must live at ``vocab_size + bin_id``. Already
+    offset values are left unchanged for compatibility with older SLAF versions.
+    """
+    is_gene_token = (input_ids >= gene_token_offset) & (input_ids < vocab_size)
+    is_raw_expr_bin = (values >= 0) & (values < n_expression_bins)
+    should_offset = is_gene_token & is_raw_expr_bin
+
+    if not should_offset.any():
+        return values
+
+    offset_values = values.clone()
+    offset_values[should_offset] = offset_values[should_offset] + vocab_size
+    return offset_values
+
+
 def _torch_prof_region(name: str) -> AbstractContextManager[Any]:
     return cast(
         AbstractContextManager[Any],
@@ -304,6 +330,14 @@ def train_step(
         input_ids = batch["input_ids"].to(device, non_blocking=_nb)
         values = batch["values"].to(device, non_blocking=_nb)
         attention_mask = batch["attention_mask"].to(device, non_blocking=_nb)
+
+        values = offset_expression_bins(
+            values,
+            input_ids,
+            config.vocab_size,
+            config.n_expression_bins,
+            config.gene_token_offset,
+        )
 
         # Clip value tokens to valid expression range (defensive guard for tokenizer bugs).
         values = clip_expression_tokens(
@@ -419,10 +453,12 @@ def train(
     slaf_path: str,
     config: ModelConfig | None = None,
     n_steps: int = 1000,
+    epochs: int = 1,
     batch_size: int = 32,
     max_genes: int = 512,
     learning_rate: float = 1e-4,
     log_every: int = 1,
+    slaf_loading_mode: str = "mos",
     gradient_accumulation_steps: int = 1,
     use_gradient_checkpointing: bool = False,
     use_compile: bool = False,
@@ -440,11 +476,13 @@ def train(
     Args:
         slaf_path: Path to SLAF dataset
         config: Model configuration (default: small)
-        n_steps: Number of training steps
+        n_steps: Maximum optimizer steps overall
+        epochs: Number of SLAF epochs to stream
         batch_size: Batch size (micro-batch if using gradient accumulation)
         max_genes: Maximum genes per cell
         learning_rate: Learning rate
         log_every: Log every N steps
+        slaf_loading_mode: SLAF loading strategy: "mos" or "by_fragment"
         gradient_accumulation_steps: Accumulate gradients over N micro-batches
             Effective batch size = batch_size * gradient_accumulation_steps
         use_gradient_checkpointing: Enable gradient checkpointing to reduce
@@ -472,6 +510,12 @@ def train(
     # Setup
     if config is None:
         config = ModelConfig.small()
+    if epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {epochs}")
+    if slaf_loading_mode not in {"mos", "by_fragment"}:
+        raise ValueError(
+            f"slaf_loading_mode must be 'mos' or 'by_fragment', got {slaf_loading_mode!r}"
+        )
 
     device = get_device()
     dtype = get_dtype(device)
@@ -489,6 +533,7 @@ def train(
     try:
         from slaf import SLAFArray
         from slaf.ml import SLAFDataLoader
+        from slaf.ml.tokenizers import ScGPTTokenizer
     except ImportError as e:
         logger.error("SLAF not installed. Install with: pip install slafdb")
         raise ImportError("slafdb required for training") from e
@@ -570,19 +615,30 @@ def train(
         else:
             logger.info("Mixed precision enabled: {} with GradScaler", amp_dtype)
 
+    tokenizer = ScGPTTokenizer(
+        slaf_array=slaf_array,
+        vocab_size=vocab_size,
+        n_expression_bins=config.n_expression_bins,
+        max_genes=max_genes,
+    )
+
     t0 = time.time()
+    use_mos = slaf_loading_mode == "mos"
     dataloader = SLAFDataLoader(
         slaf_array=slaf_array,
-        tokenizer_type="scgpt",
+        tokenizer=tokenizer,
         batch_size=batch_size,
-        max_genes=max_genes,
-        n_expression_bins=config.n_expression_bins,
-        vocab_size=vocab_size,  # Expression tokens start at vocab_size
-        use_mixture_of_scanners=True,
+        n_epochs=epochs,
+        use_mixture_of_scanners=use_mos,
+        by_fragment=True,
         prefetch_batch_size=512000,
         verbose=False,
     )
-    logger.info("SLAFDataLoader created in {:.2f}s", time.time() - t0)
+    logger.info(
+        "SLAFDataLoader created in {:.2f}s (loading_mode={})",
+        time.time() - t0,
+        slaf_loading_mode,
+    )
 
     # Sequence length (dual stream): CLS + max_genes + SEP
     seq_len = max_genes + 2
@@ -595,7 +651,11 @@ def train(
 
     # Training loop
     effective_batch_size = batch_size * gradient_accumulation_steps
-    logger.info("Starting training for {} steps", n_steps)
+    logger.info(
+        "Starting training for {} epoch(s), step cap {}",
+        epochs,
+        n_steps,
+    )
     logger.info(
         "Batch size: {} (effective: {} with {} accumulation steps)",
         batch_size,
@@ -719,6 +779,7 @@ def train(
             break
         dl_end = time.perf_counter()
         dataloader_time_ms = (dl_end - dl_start) * 1000
+        batch_epoch = int(batch.get("epoch", 0))
 
         # Debug: check token bounds on first batch
         if step == 0 and micro_step == 0:
@@ -820,6 +881,7 @@ def train(
 
                 # Build log message with GPU metrics
                 log_parts = [
+                    f"Epoch {batch_epoch + 1}/{epochs}",
                     f"Step {step + 1}/{n_steps}",
                     f"Loss: {avg_loss:.4f} (gene: {loss_dict['gene_loss']:.4f}, expr: {loss_dict['expr_loss']:.4f})",
                     f"Time: {metrics.step_time_ms:.1f}ms/step",
@@ -969,7 +1031,13 @@ def main() -> None:
         "--n_steps",
         type=int,
         default=1000,
-        help="Number of training steps",
+        help="Maximum optimizer steps overall",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="Number of SLAF epochs to stream",
     )
     parser.add_argument(
         "--batch_size",
@@ -994,6 +1062,13 @@ def main() -> None:
         type=int,
         default=10,
         help="Log every N steps",
+    )
+    parser.add_argument(
+        "--slaf-loading-mode",
+        type=str,
+        choices=["mos", "by_fragment"],
+        default="mos",
+        help="SLAF loading strategy",
     )
     parser.add_argument(
         "--model_size",
@@ -1058,10 +1133,12 @@ def main() -> None:
         slaf_path=str(slaf_path),
         config=config,
         n_steps=args.n_steps,
+        epochs=args.epochs,
         batch_size=args.batch_size,
         max_genes=args.max_genes,
         learning_rate=args.learning_rate,
         log_every=args.log_every,
+        slaf_loading_mode=args.slaf_loading_mode,
         use_strict_bf16=args.use_strict_bf16,
         torch_profiler_steps=args.torch_profiler_steps,
         torch_profiler_warmup_steps=args.torch_profiler_warmup_steps,
