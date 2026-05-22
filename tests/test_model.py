@@ -14,7 +14,7 @@ from fast_scgpt.model import (
     TokenEmbedding,
     TransformerBlock,
 )
-from fast_scgpt.train import create_mask
+from fast_scgpt.train import create_mask, offset_expression_bins
 
 
 @pytest.fixture
@@ -99,7 +99,9 @@ class TestMultiHeadAttention:
     def test_attention_shape(self, config: ModelConfig, device: torch.device) -> None:
         """Test attention output shape."""
         attn = MultiHeadAttention(config).to(device)
-        x = torch.randn(2, 100, config.d_model, device=device)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        attn = attn.to(dtype=dtype)
+        x = torch.randn(2, 100, config.d_model, device=device, dtype=dtype)
         out = attn(x)
         assert out.shape == x.shape
 
@@ -108,11 +110,32 @@ class TestMultiHeadAttention:
     ) -> None:
         """Test attention with padding mask."""
         attn = MultiHeadAttention(config).to(device)
-        x = torch.randn(2, 100, config.d_model, device=device)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        attn = attn.to(dtype=dtype)
+        x = torch.randn(2, 100, config.d_model, device=device, dtype=dtype)
         mask = torch.ones(2, 100, dtype=torch.bool, device=device)
         mask[:, 50:] = False  # Mask last 50 positions
         out = attn(x, mask)
         assert out.shape == x.shape
+
+    def test_attention_mask_excludes_padded_keys(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        attn = MultiHeadAttention(config).to(device)
+        attn.eval()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        attn = attn.to(dtype=dtype)
+        x = torch.randn(2, 12, config.d_model, device=device, dtype=dtype)
+        x_changed = x.clone()
+        x_changed[:, 6:] = torch.randn_like(x_changed[:, 6:]) * 100
+        mask = torch.ones(2, 12, dtype=torch.bool, device=device)
+        mask[:, 6:] = False
+
+        with torch.no_grad():
+            out = attn(x, mask)
+            out_changed = attn(x_changed, mask)
+
+        assert torch.allclose(out[:, :6], out_changed[:, :6], rtol=1e-4, atol=1e-4)
 
 
 class TestFeedForward:
@@ -325,6 +348,66 @@ class TestScGPT:
 
 class TestTrainMasking:
     """Tests for training masking logic."""
+
+    def test_offset_expression_bins_offsets_raw_slaf_values(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        input_ids = torch.tensor(
+            [
+                [
+                    config.cls_token_id,
+                    config.gene_token_offset,
+                    config.gene_token_offset + 1,
+                    config.sep_token_id,
+                    config.pad_token_id,
+                ]
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        values = torch.tensor([[0, 0, 7, 0, 0]], dtype=torch.long, device=device)
+
+        offset = offset_expression_bins(
+            values,
+            input_ids,
+            config.vocab_size,
+            config.n_expression_bins,
+            config.gene_token_offset,
+        )
+
+        assert offset.tolist() == [
+            [
+                0,
+                config.expr_token_offset,
+                config.expr_token_offset + 7,
+                0,
+                0,
+            ]
+        ]
+
+    def test_offset_expression_bins_leaves_already_offset_values(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        input_ids = torch.tensor(
+            [[config.cls_token_id, config.gene_token_offset, config.sep_token_id]],
+            dtype=torch.long,
+            device=device,
+        )
+        values = torch.tensor(
+            [[0, config.expr_token_offset + 3, 0]],
+            dtype=torch.long,
+            device=device,
+        )
+
+        offset = offset_expression_bins(
+            values,
+            input_ids,
+            config.vocab_size,
+            config.n_expression_bins,
+            config.gene_token_offset,
+        )
+
+        assert torch.equal(offset, values)
 
     def test_create_mask_basic(self, config: ModelConfig, device: torch.device) -> None:
         """Test basic masking functionality."""
