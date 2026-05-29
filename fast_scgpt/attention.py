@@ -31,7 +31,16 @@ FLASH_ATTN_ERROR: str | None = None
 # "fa3" | "fa4" | None (sdpa-only or unavailable)
 FLASH_ATTN_KIND: str | None = None
 flash_attn_func: Callable[..., torch.Tensor] | None = None
+flash_attn_varlen_func: Callable[..., torch.Tensor] | None = None
 _flash_attn_func_fa4: Callable[..., object] | None = None
+pad_input: Callable[..., torch.Tensor] | None = None
+unpad_input: (
+    Callable[
+        ...,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor],
+    ]
+    | None
+) = None
 
 if _FLASH_BACKEND == "sdpa":
     pass  # SDPA only
@@ -49,8 +58,14 @@ elif _FLASH_BACKEND == "fa4":
 else:
     try:
         from flash_attn import flash_attn_func as _flash_fa3_wheel
+        from flash_attn import flash_attn_varlen_func as _flash_fa3_varlen
+        from flash_attn.bert_padding import pad_input as _pad_input
+        from flash_attn.bert_padding import unpad_input as _unpad_input
 
         flash_attn_func = _flash_fa3_wheel
+        flash_attn_varlen_func = _flash_fa3_varlen
+        pad_input = _pad_input
+        unpad_input = _unpad_input
         FLASH_ATTN_AVAILABLE = True
         FLASH_ATTN_KIND = "fa3"
     except ImportError as e:
@@ -114,12 +129,69 @@ def _call_flash_attention(
     raise RuntimeError("Flash attention dispatch called with no active backend")
 
 
+def _attention_varlen_flash(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    if unpad_input is None or pad_input is None:
+        raise RuntimeError(
+            "Varlen flash attention requires flash_attn.bert_padding utilities."
+        )
+
+    keep_mask = attention_mask.to(torch.bool)
+    batch_size, seq_len = keep_mask.shape
+    n_heads = q.size(2)
+    d_head = q.size(3)
+
+    q_flat = q.reshape(batch_size, seq_len, -1)
+    k_flat = k.reshape(batch_size, seq_len, -1)
+    v_flat = v.reshape(batch_size, seq_len, -1)
+
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q_flat, keep_mask)
+    k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k_flat, keep_mask)
+    v_unpad, _, _, _, _ = unpad_input(v_flat, keep_mask)
+
+    q_unpad = q_unpad.view(-1, n_heads, d_head)
+    k_unpad = k_unpad.view(-1, n_heads, d_head)
+    v_unpad = v_unpad.view(-1, n_heads, d_head)
+
+    if flash_attn_varlen_func is None:
+        raise RuntimeError(
+            "Varlen flash attention dispatch called with no active backend"
+        )
+
+    out_unpad = cast(
+        torch.Tensor,
+        flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p if q.requires_grad else 0.0,
+            causal=causal,
+            softmax_scale=scale,
+        ),
+    )
+    out_flat = out_unpad.reshape(-1, n_heads * d_head)
+    out_padded = pad_input(out_flat, indices_q, batch_size, seq_len)
+    return out_padded.view(batch_size, seq_len, n_heads, d_head)
+
+
 def is_hopper_gpu() -> bool:
     """Check if running on H100 (Hopper architecture, sm90)."""
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major >= 9
+    return bool(props.major >= 9)
 
 
 def check_flash_attn() -> bool:
@@ -212,13 +284,15 @@ def attention_native_layout(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
     """Attention with (B, seqlen, nheads, headdim) layout.
 
-    Uses packaged FlashAttention when available; otherwise transposes for SDPA.
+    Uses packaged FlashAttention when available; with padding masks, unpads and
+    dispatches through the varlen FlashAttention kernel.
 
     Args:
         q, k, v: Tensors of shape (batch, seqlen, nheads, headdim)
@@ -231,14 +305,36 @@ def attention_native_layout(
     """
     if FLASH_ATTN_AVAILABLE and FLASH_ATTN_KIND is not None and q.is_cuda:
         dp = dropout_p if q.requires_grad else 0.0
-        return _call_flash_attention(q, k, v, dropout_p=dp, causal=causal, scale=scale)
+        if attention_mask is None:
+            return _call_flash_attention(
+                q,
+                k,
+                v,
+                dropout_p=dp,
+                causal=causal,
+                scale=scale,
+            )
+        if FLASH_ATTN_KIND == "fa3" and flash_attn_varlen_func is not None:
+            return _attention_varlen_flash(
+                q,
+                k,
+                v,
+                attention_mask=attention_mask,
+                dropout_p=dp,
+                causal=causal,
+                scale=scale,
+            )
     q_sdpa = q.transpose(1, 2)
     k_sdpa = k.transpose(1, 2)
     v_sdpa = v.transpose(1, 2)
+    attn_mask = None
+    if attention_mask is not None:
+        attn_mask = attention_mask.to(torch.bool)[:, None, None, :]
     out = F.scaled_dot_product_attention(
         q_sdpa,
         k_sdpa,
         v_sdpa,
+        attn_mask=attn_mask,
         dropout_p=dropout_p if q.requires_grad else 0.0,
         is_causal=causal,
         scale=scale,

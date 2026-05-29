@@ -134,7 +134,7 @@ class MultiHeadAttention(nn.Module):
         Args:
             x: Input of shape (batch, seq_len, d_model)
             attention_mask: Boolean mask of shape (batch, seq_len).
-                Currently ignored - FA3 doesn't support masks efficiently.
+                True for real tokens, False for padding.
 
         Returns:
             Output of shape (batch, seq_len, d_model)
@@ -156,6 +156,7 @@ class MultiHeadAttention(nn.Module):
             q,
             k,
             v,
+            attention_mask=attention_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             causal=False,  # Bidirectional attention for scGPT
             scale=self.scale,
