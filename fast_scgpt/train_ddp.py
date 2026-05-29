@@ -23,7 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.gpu_hw_metrics import DmonUtilSampler
 from fast_scgpt.model import ScGPT
-from fast_scgpt.train import clip_expression_tokens, create_mask
+from fast_scgpt.train import clip_expression_tokens, create_mask, offset_expression_bins
 
 # Indices for timing gather (dl, mask, fwd, bwd, opt, compute_total, total_ms)
 _IDX_DL, _IDX_MASK, _IDX_FWD, _IDX_BWD, _IDX_OPT, _IDX_COMPUTE, _IDX_TOTAL = range(7)
@@ -465,6 +465,13 @@ def train_ddp(
         values = batch["values"]
         attention_mask = batch["attention_mask"]
 
+        values = offset_expression_bins(
+            values,
+            input_ids,
+            config.vocab_size,
+            config.n_expression_bins,
+            config.gene_token_offset,
+        )
         values = clip_expression_tokens(
             values, config.vocab_size, config.n_expression_bins
         )

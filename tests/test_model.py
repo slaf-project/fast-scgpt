@@ -365,7 +365,7 @@ class TestTrainMasking:
             dtype=torch.long,
             device=device,
         )
-        values = torch.tensor([[0, 0, 7, 0, 0]], dtype=torch.long, device=device)
+        values = torch.tensor([[0, 1, 7, 0, 0]], dtype=torch.long, device=device)
 
         offset = offset_expression_bins(
             values,
@@ -379,7 +379,7 @@ class TestTrainMasking:
             [
                 0,
                 config.expr_token_offset,
-                config.expr_token_offset + 7,
+                config.expr_token_offset + 6,
                 0,
                 0,
             ]
@@ -398,6 +398,26 @@ class TestTrainMasking:
             dtype=torch.long,
             device=device,
         )
+
+        offset = offset_expression_bins(
+            values,
+            input_ids,
+            config.vocab_size,
+            config.n_expression_bins,
+            config.gene_token_offset,
+        )
+
+        assert torch.equal(offset, values)
+
+    def test_offset_expression_bins_ignores_pad_values(
+        self, config: ModelConfig, device: torch.device
+    ) -> None:
+        input_ids = torch.tensor(
+            [[config.cls_token_id, config.gene_token_offset, config.sep_token_id]],
+            dtype=torch.long,
+            device=device,
+        )
+        values = torch.tensor([[0, 0, 0]], dtype=torch.long, device=device)
 
         offset = offset_expression_bins(
             values,

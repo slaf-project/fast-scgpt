@@ -22,6 +22,7 @@ from typing import Any, cast
 import torch
 from loguru import logger
 from torch.autograd.profiler import record_function
+from tqdm.auto import tqdm
 
 from fast_scgpt.config import ModelConfig
 from fast_scgpt.device import get_device, get_device_info, get_dtype
@@ -263,20 +264,21 @@ def offset_expression_bins(
 ) -> torch.Tensor:
     """Convert raw expression-bin IDs to shared-vocab expression token IDs.
 
-    Newer SLAF scGPT tokenizers return a dual stream where ``values`` contains
-    raw bin IDs at gene positions. fast-scGPT embeds both streams in one shared
-    table, so expression bins must live at ``vocab_size + bin_id``. Already
-    offset values are left unchanged for compatibility with older SLAF versions.
+    SLAF scGPT tokenizers return a dual stream where ``values`` contains
+    one-based expression bins at gene positions (0 is PAD, 1..N are real bins).
+    fast-scGPT embeds both streams in one shared table, so expression bins must
+    live at ``vocab_size + zero_based_bin_id``. Already offset values are left
+    unchanged for compatibility with older SLAF versions.
     """
     is_gene_token = (input_ids >= gene_token_offset) & (input_ids < vocab_size)
-    is_raw_expr_bin = (values >= 0) & (values < n_expression_bins)
+    is_raw_expr_bin = (values > 0) & (values <= n_expression_bins)
     should_offset = is_gene_token & is_raw_expr_bin
 
     if not should_offset.any():
         return values
 
     offset_values = values.clone()
-    offset_values[should_offset] = offset_values[should_offset] + vocab_size
+    offset_values[should_offset] = offset_values[should_offset] - 1 + vocab_size
     return offset_values
 
 
@@ -751,6 +753,12 @@ def train(
                 n_steps,
             )
 
+    progress = tqdm(
+        total=n_steps,
+        desc=f"Epoch 1/{epochs}",
+        leave=True,
+        dynamic_ncols=True,
+    )
     while step < n_steps:
         if (
             torch_profiler_steps > 0
@@ -875,6 +883,14 @@ def train(
 
             # Update metrics with TOTAL time for all micro-steps
             metrics.update(accum_step_ms, effective_batch_size, seq_len, device)
+            progress.set_description(f"Epoch {batch_epoch + 1}/{epochs}")
+            progress.set_postfix(
+                loss=f"{loss_dict['loss']:.4f}",
+                gene=f"{loss_dict['gene_loss']:.4f}",
+                expr=f"{loss_dict['expr_loss']:.4f}",
+                cells_per_sec=f"{metrics.cells_per_sec:.0f}",
+            )
+            progress.update(1)
 
             if (step + 1) % log_every == 0:
                 avg_loss = total_loss / (log_every * gradient_accumulation_steps)
@@ -955,6 +971,10 @@ def train(
                 hw_sampler = DmonUtilSampler(n_gpus=n_cuda_devices)
                 if not hw_sampler.start():
                     hw_sampler = None
+
+    progress.total = step
+    progress.refresh()
+    progress.close()
 
     if profiler_ctx is not None:
         set_torch_profiler_active(False)
